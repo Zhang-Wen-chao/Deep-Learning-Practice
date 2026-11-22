@@ -1,11 +1,13 @@
 # HY3 架构
 
 腾讯混元 **Hy3** 的 shape、参数、FLOPs、访存账本。**不下载权重**：所有数字只由本目录的
-[`config.json`](config.json) 推出，脚本是 [`accounting.py`](accounting.py)，原始输出在
-[`runs/accounting.log`](runs/accounting.log)。
+[`config.json`](config.json) 推出，脚本是 [`accounting.py`](accounting.py)（账本）和
+[`shapes.py`](shapes.py)（shape 流水）。
+形状流水在 [`runs/hy3_shapes.log`](runs/hy3_shapes.log)，参数/FLOPs/访存账本在
+[`accounting.log`](accounting.log)。
 
 > 口径：参数量 / FLOPs 用十进制（`1B = 10^9`，`1T = 10^12`）；字节同时给 GB（`10^9`）和 GiB（`2^30`）。
-> 权重按 `bfloat16`（2 B/元素）算。attention 的 `T×T` 项按完整矩阵乘算，是上界；
+> 权重按 `bfloat16`（2 B/元素）算。attention 的 `seq_len × seq_len` 项按完整矩阵乘算，是上界；
 > causal 实际约一半，文中单独注明。
 
 ## 1. 任务
@@ -65,7 +67,8 @@ HYV3ForCausalLM   ← LlamaForCausalLM
 
 ## 2. 记号
 
-模型结构全在 `config.json` 里，直接用字段名，不再另起一套符号；只有 `T`、`C`、`batch_size` 是运行时才有的。
+模型结构全在 `config.json` 里，直接用字段名，不再另起一套符号。运行时的长度也不造新符号，
+沿用 GPT 那篇的 `batch_size`、`seq_len`、`q_len`、`kv_len`：
 
 `config.json` 取自 [`tencent/Hy3`](https://huggingface.co/tencent/Hy3/raw/main/config.json)，47 行，原样放在本目录。
 权重/模型卡是 Apache-2.0；Transformers 的 `hy_v3` 代码也是 Apache-2.0。
@@ -106,6 +109,15 @@ kv_dim  =  8 × 128 = 1024        # k/v_proj 的输出宽度
 group   = 64 / 8   = 8           # 每个 KV 头服务 8 个 Q 头
 ```
 
+运行时的长度：
+
+| 符号 | 值 | 来源 |
+| --- | --- | --- |
+| `batch_size` | 1 | 一次并行几条序列 |
+| `seq_len` | 4096 | prefill 的 token 数 |
+| `q_len` | `seq_len`（prefill）/ 1（decode） | 当前 forward 的 query 数 |
+| `kv_len` | `seq_len`（prefill）/ 历史 + 1（decode） | K/V 的长度 |
+
 两个容易记错的：
 
 - `head_dim` 是 128，但 `q_dim = 8192 ≠ hidden_size = 4096`。Q 投影是**变宽**的。
@@ -136,13 +148,13 @@ group   = 64 / 8   = 8           # 每个 KV 头服务 8 个 Q 头
 
 ```mermaid
 flowchart TD
-    TK(["token ids<br/>(batch, T)"]) --> E["Embedding<br/>120832 × 4096<br/>(batch, T, 4096)"]
+    TK(["token ids<br/>(batch_size, seq_len)"]) --> E["Embedding<br/>120832 × 4096<br/>(batch_size, seq_len, 4096)"]
     E --> L0["Layer 0 · Dense<br/>Attention + FFN 13312"]
     L0 --> L1["Layer 1 · MoE<br/>Attention + 192选8 + shared"]
     L1 --> DOTS["⋮ 层 2–79 同构"]
-    DOTS --> LN["Final RMSNorm<br/>(batch, T, 4096)"]
+    DOTS --> LN["Final RMSNorm<br/>(batch_size, seq_len, 4096)"]
     LN --> HD["lm_head<br/>4096 → 120832<br/>（不共享）"]
-    HD --> LOGITS["logits<br/>(batch, T, 120832)"]
+    HD --> LOGITS["logits<br/>(batch_size, seq_len, 120832)"]
 
     E -.-> MTP["MTP · layer 80<br/>enorm/hnorm + eh_proj<br/>1 层 MoE + norm"]
     LN -. "上一 token 的 hidden" .-> MTP
@@ -161,38 +173,42 @@ flowchart TD
 
 ### 3.3 一个 block 的 shape
 
-记 `T` 为序列长度，`B` 为 batch。下面默认 `B = 1`。
+下面默认 `batch_size = 1`；prefill 取 `seq_len = 4096`，decode 取 `q_len = 1`、`kv_len = 131072`。
 
-#### 3.3.1 prefill（一次喂 T 个 token）
+#### 3.3.1 prefill（一次喂 seq_len 个 token）
 
 | 操作 | shape | 说明 |
 | --- | --- | --- |
-| `x` | `(1, T, 4096)` | 上一层输出 |
-| `input_layernorm` | `(1, T, 4096)` | RMSNorm，每 token 独立 |
-| `q_proj` | `(1, T, 8192)` | 4096 → 64×128 |
-| `k_proj` / `v_proj` | `(1, T, 1024)` | 4096 → 8×128 |
-| `q` reshape | `(1, 64, T, 128)` | `view(1,T,64,128).transpose(1,2)` |
-| `k` / `v` reshape | `(1, 8, T, 128)` | 同上 |
-| `q_norm` / `k_norm` | `(1, 64, T, 128)` / `(1, 8, T, 128)` | 最后一维 128 上做 RMSNorm |
+| `x` | `(1, seq_len, 4096)` | 上一层输出 |
+| `input_layernorm` | `(1, seq_len, 4096)` | RMSNorm，每 token 独立 |
+| `q_proj` | `(1, seq_len, 8192)` | 4096 → 64×128 |
+| `k_proj` / `v_proj` | `(1, seq_len, 1024)` | 4096 → 8×128 |
+| `q` 拆头 | `(1, 64, seq_len, 128)` | `view(1, seq_len, 64, 128)` 后 `.transpose(1, 2)` |
+| `k` / `v` 拆头 | `(1, 8, seq_len, 128)` | 同上（KV 头 8 个） |
+| `q_norm` / `k_norm` | `(1, 64, seq_len, 128)` / `(1, 8, seq_len, 128)` | 最后一维 128 上做 RMSNorm |
 | RoPE | 不变 | 只作用在 Q/K，不作用 V |
-| `repeat_kv` | `(1, 64, T, 128)` | 概念上每个 KV 头复制 8 份 |
-| `scores = q @ kᵀ` | `(1, 64, T, T)` | 除以 `√128`，加 causal mask |
-| `softmax` | `(1, 64, T, T)` | 最后一维归一化 |
-| `attn @ V` | `(1, 64, T, 128)` | 加权求和 |
-| 拼头 | `(1, T, 8192)` | 64×128 拼回 8192 |
-| `o_proj` | `(1, T, 4096)` | 8192 → 4096 |
-| `+ residual` | `(1, T, 4096)` | 逐元素 |
-| `post_attention_layernorm` | `(1, T, 4096)` | 第二个 RMSNorm |
-| `x` flatten | `(T, 4096)` | MoE 按 token 路由 |
-| `router` | `(T, 192)` | `x @ W_rᵀ`，fp32 |
-| `top-k` | `(T, 8)` | 选 8 个专家 |
-| 每个专家 `gate_up` | `(n_e, 3072)` | `n_e ≈ T×8/192` |
+| `repeat_kv` | `(1, 64, seq_len, 128)` | 概念上每个 KV 头复制 8 份 |
+| `scores = q @ kᵀ` | `(1, 64, seq_len, seq_len)` | 除以 `√128`，加 causal mask |
+| `softmax` | `(1, 64, seq_len, seq_len)` | 最后一维归一化 |
+| `attn @ V` | `(1, 64, seq_len, 128)` | 加权求和 |
+| 拼头 | `(1, seq_len, 8192)` | 64×128 拼回 8192 |
+| `o_proj` | `(1, seq_len, 4096)` | 8192 → 4096 |
+| `+ residual` | `(1, seq_len, 4096)` | 逐元素 |
+| `post_attention_layernorm` | `(1, seq_len, 4096)` | 第二个 RMSNorm |
+| `x` flatten | `(seq_len, 4096)` | MoE 按 token 路由 |
+| `router` | `(seq_len, 192)` | `x @ W_rᵀ`，fp32 |
+| `top-k` | `(seq_len, 8)` | 选 8 个专家 |
+| 每个专家 `gate_up` | `(n_e, 3072)` | `n_e ≈ seq_len × 8 / 192` |
 | 每个专家 `down` | `(n_e, 4096)` | 1536 → 4096 |
-| shared expert | `(T, 1536) → (T, 4096)` | 永远算 |
-| 合并 | `(T, 4096) → (1, T, 4096)` | `routed + shared` |
-| `+ residual` | `(1, T, 4096)` | 第二层残差 |
+| shared expert | `(seq_len, 1536) → (seq_len, 4096)` | 永远算 |
+| 合并 | `(seq_len, 4096) → (1, seq_len, 4096)` | `routed + shared` |
+| `+ residual` | `(1, seq_len, 4096)` | 第二层残差 |
 
-`T = 4096` 时，`scores` 是 `(1, 64, 4096, 4096)`，约 **10.7 亿个数**，bf16 要 **2.1 GB**
+> **拆头不是 `reshape`。** `view(1, seq_len, 64, 128)` 只是把 8192 拆成 `64 × 128`；
+> 还要 `.transpose(1, 2)` 把 `heads` 挪到 `seq_len` 前面，才是 `(1, 64, seq_len, 128)`。
+> 只 reshape 不 transpose，`scores` 的头维和序列维会对错。
+
+`seq_len = 4096` 时，`scores` 是 `(1, 64, 4096, 4096)`，约 **10.7 亿个数**，bf16 要 **2.1 GB**
 —— 一层就这么多。所以真实的 attention 不会把 `scores` 写出来，用 FlashAttention
 分块算；这里列形状是为了理解，不是为了真分配。
 
@@ -203,10 +219,10 @@ flowchart TD
 | `x` | `(1, 1, 4096)` | 新 token |
 | `q_proj` | `(1, 1, 8192)` → `(1, 64, 1, 128)` | 只有 1 个位置 |
 | `k_proj` / `v_proj` | `(1, 1, 1024)` → `(1, 8, 1, 128)` | 只有新 token 的 K/V |
-| KV cache 追加 | `(1, 8, C, 128)` | `C` = 历史 + 当前 |
-| `repeat_kv` | `(1, 64, C, 128)` | 概念上 |
-| `scores` | `(1, 64, 1, C)` | q_len = 1，kv_len = C |
-| `softmax` | `(1, 64, 1, C)` | 每个 Q 对全部历史归一化 |
+| KV cache 追加 | `(1, 8, kv_len, 128)` | `kv_len` = 历史 + 当前 |
+| `repeat_kv` | `(1, 64, kv_len, 128)` | 概念上 |
+| `scores` | `(1, 64, 1, kv_len)` | q_len = 1，kv_len = 历史 + 1 |
+| `softmax` | `(1, 64, 1, kv_len)` | 每个 Q 对全部历史归一化 |
 | `attn @ V` | `(1, 64, 1, 128)` | 加权求和 |
 | `o_proj` | `(1, 1, 4096)` | — |
 | MoE | `(1, 4096) → (1, 4096)` | 1 个 token 选 8 个专家 |
@@ -214,9 +230,9 @@ flowchart TD
 
 decode 和 prefill 的差别只有三处：
 
-1. `q_len = 1`，不是 `T`；
+1. `q_len = 1`，不是 `seq_len`；
 2. `k/v` 不再重新投影整段，而是从 cache 读；
-3. `scores` 是 `1 × C`，不是 `T × T`。
+3. `scores` 是 `1 × kv_len`，不是 `seq_len × seq_len`。
 
 **这就是为什么推理要分两阶段**：prefill 的矩阵乘很大、能跑满算力；
 decode 的矩阵乘退化成矩阵-向量，瓶颈从算力换成带宽。
@@ -229,7 +245,7 @@ K:  8 头 × 128 维 = 1024
 V:  8 头 × 128 维 = 1024
             │
             ├─ 每个 KV 头被 8 个 Q 头共享
-            └─ scores 仍然是 64 头： (1, 64, T, C)
+            └─ scores 仍然是 64 头： (1, 64, seq_len, kv_len)
 ```
 
 GQA 省的不是 `scores` 的 FLOPs（还是 64 头），省的是：
@@ -247,8 +263,8 @@ GQA 省的不是 `scores` 的 FLOPs（还是 64 头），省的是：
 Q/K 投影之后、RoPE 之前，每个头在 128 维上做一次 RMSNorm：
 
 ```
-q: (1, 64, T, 128) → 每个头独立归一化 → (1, 64, T, 128)
-k: (1,  8, T, 128) → 每个头独立归一化 → (1,  8, T, 128)
+q: (1, 64, seq_len, 128) → 每个头独立归一化 → (1, 64, seq_len, 128)
+k: (1,  8, seq_len, 128) → 每个头独立归一化 → (1,  8, seq_len, 128)
 ```
 
 - 参数只有 `q_norm.weight` + `k_norm.weight` = 2×128 = **256 个/层**；
@@ -295,10 +311,10 @@ x = residual + x
 每个 token 的 4096 维向量，过一个小矩阵 `W_r`（192×4096，**fp32**）：
 
 ```
-logits = x @ W_rᵀ                  # (T, 192)
+logits = x @ W_rᵀ                  # (seq_len, 192)
 p      = sigmoid(logits)           # 不是 softmax
 s      = p + e_score_correction_bias   # 192 个 buffer，只影响“选谁”
-idx    = topk(s, 8)                # (T, 8)
+idx    = topk(s, 8)                # (seq_len, 8)
 w      = p.gather(idx)             # 注意：用 p，不用 s
 w      = w / sum(w)                # route_norm：8 个权重和 = 1
 w      = w * 2.826                 # router_scaling_factor
@@ -330,15 +346,15 @@ out[token] += y_e * w          # 按路由权重加权
 - 一个 token 只算 top-8，即 **150,994,944** 个专家参数（151M），
   不是 3.62B。
 
-`n_e` 是分到专家 `e` 的 token 数。理想均匀时 `n_e = T × 8 / 192 = T/24`；
-`T = 4096` 时约 171 个 token/专家。
+`n_e` 是分到专家 `e` 的 token 数。理想均匀时 `n_e = seq_len × 8 / 192 = seq_len / 24`；
+`seq_len = 4096` 时约 171 个 token/专家。
 
 #### 3.4.3 shared expert：永远算的那一个
 
 除了 192 个路由专家，每层还有 **1 个 shared expert**：
 
 ```
-y_s = down(silu(gate(x)) * up(x))    # (T, 4096)
+y_s = down(silu(gate(x)) * up(x))    # (seq_len, 4096)
 ```
 
 - 中间宽度也是 1536，参数 18,874,368/层；
@@ -532,7 +548,7 @@ RoPE                → ~6 FLOPs/元素
 
 MoE 只算 **top-8 + shared**，不算另外 184 个专家。这是全文最容易算错的地方。
 
-手算一个算子（`q_proj`，`T = 4096`）：
+手算一个算子（`q_proj`，`seq_len = 4096`）：
 
 ```
 m = 4096（token）, k = 4096, n = 8192
@@ -544,7 +560,7 @@ m = 4096（token）, k = 4096, n = 8192
 
 四个投影（q/k/v/o）加起来约 `618G`，和 §5.2 的 `618.475G` 对得上。
 
-### 5.2 prefill：`T = 4096`
+### 5.2 prefill：`seq_len = 4096`
 
 | 部分 | 每层 | × 层数 | 合计 |
 | --- | --- | --- | --- |
@@ -555,7 +571,7 @@ m = 4096（token）, k = 4096, n = 8192
 
 平均每 token：**51.218 G FLOPs**。
 
-MoE 层拆开（`T = 4096`）：
+MoE 层拆开（`seq_len = 4096`）：
 
 | 子项 | FLOPs | 占比 |
 | --- | --- | --- |
@@ -571,9 +587,9 @@ MoE 层拆开（`T = 4096`）：
 
 - **MoE 的专家占一半**（1.237T / 2.572T ≈ 48%），attention 占 45%；
 - **router 很便宜**（0.25%），贵的是被选中的专家；
-- 序列短时 `T×T` 项小；`T = 4096` 时它已经占 attention 的 47%。
+- 序列短时 `seq_len × seq_len` 项小；`seq_len = 4096` 时它已经占 attention 的 47%。
 
-### 5.3 decode：1 token，上下文 `C = 131072`
+### 5.3 decode：1 token，上下文 `kv_len = 131072`
 
 | 部分 | 每层 | × 层数 | 合计 |
 | --- | --- | --- | --- |
@@ -587,7 +603,7 @@ MoE 层拆开：
 | 子项 | FLOPs | 说明 |
 | --- | --- | --- |
 | Q/K/V/O | 150.995 M | 只算新 token |
-| scores + attn@V | 4.295 G | `4 × C × 64 × 128` |
+| scores + attn@V | 4.295 G | `4 × kv_len × 64 × 128` |
 | top-8 experts | 301.990 M | 8 × 6×H×Im |
 | shared expert | 37.749 M | 6×H×Im |
 | router | 1.573 M | `2×H×E` |
@@ -596,9 +612,9 @@ MoE 层拆开：
 
 关键对比：
 
-- `C = 0` 时，decode 是 **40.375 G FLOPs/token**；
-- `C = 131072` 时，涨到 **387.328 G**，其中 **343.6 G 是 attention 的 C 项**（88.7%）；
-- `C = 262144` 时，涨到 **734.281 G**，attention C 项占 **93.6%**。
+- `kv_len = 0` 时，decode 是 **40.375 G FLOPs/token**；
+- `kv_len = 131072` 时，涨到 **387.328 G**，其中 **343.6 G 是 attention 的 kv_len 项**（88.7%）；
+- `kv_len = 262144` 时，涨到 **734.281 G**，attention kv_len 项占 **93.6%**。
 
 所以长上下文 decode 的 FLOPs 看起来是 attention 主导，但它仍然是**带宽瓶颈**
 （见 6.4）：读 KV 的字节涨得一样快，算术强度只有 4.65（128K）/ 5.81（256K），
@@ -606,27 +622,27 @@ MoE 层拆开：
 
 ### 5.4 校验：`2 × 激活参数`
 
-| 口径 | decode `C=0` | prefill `T=4096` |
+| 口径 | decode `kv_len=0` | prefill `seq_len=4096` |
 | --- | --- | --- |
 | `2 × (激活参数 − embedding)` | 40.362 G | 165.321 T |
 | 逐算子求和 | 40.375 G | 209.787 T |
 | 差 | +0.013 G（0.03%） | +44.466 T（26.9%） |
 
 decode 的差只有 norm / softmax 的零头，两条路对上。
-prefill 的差是 **attention 的 `T×T` 项 + softmax**：`T = 4096` 时约 44.47T。
+prefill 的差是 **attention 的 `seq_len × seq_len` 项 + softmax**：`seq_len = 4096` 时约 44.47T。
 这也说明：
 
-> 短序列用「2 × 激活参数」估 FLOPs 很准；长序列必须单独加 `T×T`。
+> 短序列用「2 × 激活参数」估 FLOPs 很准；长序列必须单独加 `seq_len × seq_len`。
 
 ### 5.5 如果它是 dense 模型
 
 ```
 dense 每 token = 2 × 295.03B = 590.07 G FLOPs
-HY3 每 token   = 40.36 G（C=0）
+HY3 每 token   = 40.36 G（kv_len=0）
                 → 14.6 倍差距
 ```
 
-prefill `T=4096`：
+prefill `seq_len=4096`：
 
 ```
 dense = 2 × 295.03B × 4096 = 2.417 P FLOPs
@@ -644,13 +660,13 @@ MoE 省的是**权重读取和专家计算**，不省 attention。上下文越�
 
 | 场景 | 读什么 | 字节 |
 | --- | --- | --- |
-| prefill（长 T） | 全部 192 个专家 + 全部主干 | **590.07 GB** |
+| prefill（长 seq_len） | 全部 192 个专家 + 全部主干 | **590.07 GB** |
 | prefill，lm_head 按 fp32 | 同上，lm_head 4 B/元素 | 591.06 GB |
 | decode 1 token | 只读 top-8 + shared + attention + lm_head | **40.36 GB** |
 | decode，lm_head 按 fp32 | 同上，lm_head 4 B/元素 | 41.35 GB |
 | 含 MTP 权重（常驻） | 主干 + 1 层 MTP | 597.57 GB |
 
-prefill 为什么读全部专家：`T = 4096`、每 token 选 8 个，共 32,768 次选择，
+prefill 为什么读全部专家：`seq_len = 4096`、每 token 选 8 个，共 32,768 次选择，
 192 个专家几乎必然全部被命中。decode 只处理 1 个 token，只读 8 个专家，
 所以权重流量从 590 GB 掉到 40 GB —— **14.6 倍**，和 FLOPs 的降幅一致。
 
@@ -678,7 +694,7 @@ lm_head（494.93M × 2B）                0.990 GB
 80 层        = 320 KiB/token
 ```
 
-| 上下文 C | KV 大小 | 备注 |
+| kv_len | KV 大小 | 备注 |
 | --- | --- | --- |
 | 1K | 320 MiB | 0.335 GB |
 | 8K | 2.5 GiB | 2.684 GB |
@@ -689,7 +705,7 @@ lm_head（494.93M × 2B）                0.990 GB
 
 几个直接后果：
 
-- KV 随 C **线性**涨，权重不变；长上下文服务的显存主要被 KV 吃；
+- KV 随 kv_len **线性**涨，权重不变；长上下文服务的显存主要被 KV 吃；
 - batch 32、128K 上下文 = `32 × 40 GiB = 1.25 TiB` KV，必须 TP/PP 分片；
 - TP=8 时每个 GPU 只存 1 个 KV 头，KV 也除以 8：
   256K 单序列每 GPU 10 GiB。
@@ -700,7 +716,7 @@ decode 一个 token 的激活读写粗估 **19.3 MB**，相对 40.36 GB 权重�
 
 prefill 的激活粗估：
 
-| T | 激活读写（未融合上界） | 相对权重 |
+| seq_len | 激活读写（未融合上界） | 相对权重 |
 | --- | --- | --- |
 | 1024 | 19.8 GB | 3.4% |
 | 4096 | 79.2 GB | 13.4% |
@@ -709,7 +725,7 @@ prefill 的激活粗估：
 
 这个数假设每个中间张量都写回 HBM 再读出来（未融合）。真实 kernel 会融合
 QKV、MLP、FlashAttention，实际远低于此。它的用途是给一个**上界**：
-即使按这个上界，prefill 在 `T ≥ 1024` 时仍然是算力瓶颈，结论不变。
+即使按这个上界，prefill 在 `seq_len ≥ 1024` 时仍然是算力瓶颈，结论不变。
 
 ### 6.4 算术强度与 roofline
 
@@ -724,7 +740,7 @@ QKV、MLP、FlashAttention，实际远低于此。它的用途是给一个**上�
 
 **prefill**（权重全读，激活按未融合上界）：
 
-| T | FLOPs | Bytes | 算术强度 | t_mem | t_compute@40% MFU |
+| seq_len | FLOPs | Bytes | 算术强度 | t_mem | t_compute@40% MFU |
 | --- | --- | --- | --- | --- | --- |
 | 256 | 10.510 T | 595.1 GB | 17.66 | 18.6 ms | 22.2 ms |
 | 1024 | 44.120 T | 610.2 GB | 72.30 | 19.1 ms | 93.2 ms |
@@ -732,15 +748,15 @@ QKV、MLP、FlashAttention，实际远低于此。它的用途是给一个**上�
 | 16384 | 1.372 P | 912.2 GB | 1504 | 28.5 ms | 2.90 s |
 | 131072 | 50.768 P | 3.167 TB | 16028 | 99.0 ms | 107.2 s |
 
-分界点在 `T ≈ 512`：
+分界点在 `seq_len ≈ 512`：
 
-- `T = 256`：算术强度 17.7 < 37，**带宽瓶颈**；
-- `T = 1024`：72.3 > 37，**算力瓶颈**；
-- `T ≥ 4096`：远大于 37，算力绝对主导。
+- `seq_len = 256`：算术强度 17.7 < 37，**带宽瓶颈**；
+- `seq_len = 1024`：72.3 > 37，**算力瓶颈**；
+- `seq_len ≥ 4096`：远大于 37，算力绝对主导。
 
-**decode**（只读 top-8，KV 随 C 涨）：
+**decode**（只读 top-8，KV 随 kv_len 涨）：
 
-| C | FLOPs/token | Bytes/token | 算术强度 | t_mem | tok/s 上限（batch 1） |
+| kv_len | FLOPs/token | Bytes/token | 算术强度 | t_mem | tok/s 上限（batch 1） |
 | --- | --- | --- | --- | --- | --- |
 | 0 | 40.375 G | 40.381 GB | **1.00** | 1.26 ms | 792 |
 | 1K | 43.086 G | 40.716 GB | 1.06 | 1.27 ms | 786 |
@@ -755,7 +771,7 @@ QKV、MLP、FlashAttention，实际远低于此。它的用途是给一个**上�
 - `tok/s 上限` = 32 TB/s ÷ Bytes/token，是**理论带宽上限**，不含 TP 通信、调度、采样；
 - 实际按 50% 带宽效率估，上表除以 2；
 - decode 的算术强度从 1.00 涨到 5.81，但始终 < 37，**任何上下文长度下都是带宽瓶颈**；
-- 为什么 `C=0` 恰好是 1.00：BF16 权重每字节对应 2 FLOPs 的矩阵乘，
+- 为什么 `kv_len=0` 恰好是 1.00：BF16 权重每字节对应 2 FLOPs 的矩阵乘，
   而每 token 的 FLOPs 又约等于 `2 × 激活参数`。这是 MoE decode 的常态。
 
 **batching 的收益**：decode 一步的权重读取（40.36 GB）由整个 batch 共享，
@@ -802,11 +818,11 @@ H100 80GB 的账：
 
 | 场景 | 估算 | 说明 |
 | --- | --- | --- |
-| decode `C=0` | 1.26 ms/token → 792 tok/s | 100% 带宽，batch 1 |
-| decode `C=128K` | 2.60 ms/token → 384 tok/s | 100% 带宽，batch 1 |
-| decode `C=256K` | 3.95 ms/token → 253 tok/s | 100% 带宽，batch 1 |
-| prefill `T=1024` | 93 ms | 40% MFU，算力瓶颈 |
-| prefill `T=4096` | 443 ms | 40% MFU，算力瓶颈 |
+| decode `kv_len=0` | 1.26 ms/token → 792 tok/s | 100% 带宽，batch 1 |
+| decode `kv_len=128K` | 2.60 ms/token → 384 tok/s | 100% 带宽，batch 1 |
+| decode `kv_len=256K` | 3.95 ms/token → 253 tok/s | 100% 带宽，batch 1 |
+| prefill `seq_len=1024` | 93 ms | 40% MFU，算力瓶颈 |
+| prefill `seq_len=4096` | 443 ms | 40% MFU，算力瓶颈 |
 
 这些是**上限/量级**，不是 vLLM/SGLang 的实测。真实数字会被 TP 通信、
 MoE all-to-all、路由不均衡、采样、调度拉低。L3b 要上真机才能填。
@@ -870,7 +886,7 @@ Apple M4 / 16 GB / arm64 / 无 CUDA / MPS
 | decode 每 token 读权重 | **40.36 GB** | 只读 top-8 专家，不读全部 192 个 |
 | KV cache / token | **320 KiB**（每层 4 KiB） | 80 层 × 2 × 8 KV heads × 128 |
 | 256K 上下文 KV | **80 GiB** | 262,144 × 320 KiB |
-| decode 算术强度（C=0） | **1.00 FLOP/B** | 40.38G FLOPs ÷ 40.38GB |
+| decode 算术强度（kv_len=0） | **1.00 FLOP/B** | 40.38G FLOPs ÷ 40.38GB |
 | 8×H20-3e 显存 | 768 GB，权重占 597.57 GB | 剩 170.4 GB 给 KV / 激活 |
 
 > **这是一个 295B 总参数、20.7B 激活、80 层、每层 192 选 8 的 MoE；
@@ -881,29 +897,32 @@ decode 每 token 只搬约 40 GB 权重，算术强度约 1，天然带宽瓶颈
 ## 附：复现
 
 ```bash
-# 默认：prefill 4096，decode 上下文 128K，8×H20-3e
+# 1) shape 流水：只按 config 推形状，不加载权重
+python llm/hy3/shapes.py
+# → llm/hy3/runs/hy3_shapes.log
+
+# 2) 参数 / FLOPs / 访存账本
 python llm/hy3/accounting.py
+# → llm/hy3/accounting.log
 
-# 换参数
+# 换账本参数
 python llm/hy3/accounting.py --prefill 1024 --context 32768 --hardware h100x8
-
-# 原始输出
-llm/hy3/runs/accounting.log
 ```
 
-`accounting.py` 只读 `config.json`，不 import torch，不联网，不加载权重。
-改 config 里的任何字段，账本会跟着变；这是它作为「唯一真源」的用法。
+`shapes.py` 和 `accounting.py` 都只读 `config.json`，不 import torch，不联网，不加载权重。
+改 config 里的任何字段，shape 流水和账本会跟着变；这是它作为「唯一真源」的用法。
+L2 的真实权重前向跑不了（597.6 GB），`hy3_shapes.log` 是用真实 config 维度做的 shape 推演。
 
 ---
 
 ## 附：下一步
 
 - [x] `config.json` + 代码来源
+- [x] shape 流水：`shapes.py` → `runs/hy3_shapes.log`
 - [x] 参数量账本（和 298.79B 逐位对上）
 - [x] FLOPs / 访存 / KV cache
 - [x] 架构与 shape 文档
-- [ ] tiny config 跑通同构代码：`H=64, L=3, E=8, top_k=2, I=128, Im=64`，
-      验证 shape 和公式（本机可跑）
+- [ ] tiny config 跑通同构代码（可选）：`hidden_size=64, num_hidden_layers=3, num_experts=8, num_experts_per_tok=2`
 - [ ] L3b：8×H20-3e 上跑 vLLM/SGLang，填实测列
 - [ ] 和 HY3-FP8 的权重/访存对比（FP8 约 299 GB）
 - [ ] HY4 / HY4-Flash

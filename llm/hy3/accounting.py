@@ -396,7 +396,7 @@ def main():
     print(f"  开 MTP 时再加               {num(p['active_mtp'])} / draft token")
     print(f"  总参数 : 激活参数           {p['main'] / p['active_main']:.2f} : 1")
 
-    section(f"4. FLOPs：prefill T={args.prefill}（完整 T×T，未按 causal 减半）")
+    section(f"4. FLOPs：prefill seq_len={args.prefill}（完整 seq_len × seq_len，未按 causal 减半）")
     pre = flops_prefill(d, args.prefill)
     print(f"  layer 0（dense）            {rate(pre['dense']['total'])} FLOPs")
     print(f"  MoE 层（每层）              {rate(pre['moe']['total'])} FLOPs")
@@ -414,17 +414,17 @@ def main():
     print(f"  平均每 token                {rate(pre['per_token'])} FLOPs/token")
     print()
     linear_check = (p["active_main"] - p["embed"]) * 2 * args.prefill
-    print(f"  校验：2 × (激活参数 − embedding) × T")
+    print(f"  校验：2 × (激活参数 − embedding) × seq_len")
     print(f"        = 2 × {p['active_main'] - p['embed']:,} × {args.prefill}")
     print(f"        = {rate(linear_check)}  ← 不含 T×T 注意力与 norm/softmax")
 
-    section(f"5. FLOPs：decode 1 token（上下文 {args.context}）")
+    section(f"5. FLOPs：decode 1 token（kv_len = {args.context}）")
     dec = flops_decode(d, args.context)
     print(f"  layer 0（dense）            {rate(dec['dense']['total'])} FLOPs")
     print(f"  MoE 层（每层）              {rate(dec['moe']['total'])} FLOPs")
     print(f"    attention                 {rate(dec['moe']['attn']['total'])}")
     print(f"      q/k/v/o（只算新 token）  {rate(dec['moe']['attn']['linear'])}")
-    print(f"      scores + attn@V（C 项）  {rate(dec['moe']['attn']['scores'] * 2)}")
+    print(f"      scores + attn@V（kv_len 项）  {rate(dec['moe']['attn']['scores'] * 2)}")
     print(f"    MoE                       {rate(dec['moe']['mlp']['total'])}")
     print(f"  {d['L'] - d['first_dense']} 个 MoE 层合计          {rate((d['L'] - d['first_dense']) * dec['moe']['total'])}")
     print(f"  lm_head                     {rate(dec['lm_head'])}")
@@ -449,12 +449,12 @@ def main():
     print(f"  prefill 读权重（全部专家）  {byt(pre_w)}")
     print(f"    若 lm_head 按 fp32 读       {byt(pre_w32)}")
     print(f"  prefill 激活读写（粗估）    {byt(act_pre)}")
-    print(f"  prefill 写 KV（T={args.prefill}）      {byt(kv_tok * args.prefill)}")
+    print(f"  prefill 写 KV（seq_len={args.prefill}）      {byt(kv_tok * args.prefill)}")
     print()
     print(f"  decode 读权重（只读 top-{d['top_k']}）  {byt(dec_w)}")
     print(f"    若 lm_head 按 fp32 读       {byt(dec_w32)}")
     print(f"  decode 激活读写（粗估）     {byt(act_dec)}")
-    print(f"  decode 读 KV（C={args.context}）    {byt(kv_ctx)}")
+    print(f"  decode 读 KV（kv_len={args.context}）    {byt(kv_ctx)}")
     print(f"    KV / token / layer        {byt(kv_tok // d['L'])}")
     print(f"    KV / token（{d['L']} 层）        {byt(kv_tok)}")
     print(f"    KV 占满 {d['max_pos']} 上下文     {byt(bytes_kv_at(d, d['max_pos']))}")
@@ -473,8 +473,8 @@ def main():
     print(f"  显存                        {byt(mem)}")
     print()
     for label, fl, by in [
-        (f"prefill T={args.prefill}", pre["total"], pre_w + act_pre + kv_tok * args.prefill),
-        (f"decode C={args.context}", dec["total"], dec_w + act_dec + kv_ctx),
+        (f"prefill seq_len={args.prefill}", pre["total"], pre_w + act_pre + kv_tok * args.prefill),
+        (f"decode kv_len={args.context}", dec["total"], dec_w + act_dec + kv_ctx),
     ]:
         ai = fl / by
         t_mem = by / peak_bw
@@ -487,22 +487,22 @@ def main():
 
     section("8. 扫描：prefill 与 decode")
     print("  prefill（全部专家；激活按未融合的粗略上界）")
-    print(f"  {'T':>8} {'FLOPs':>12} {'每 token':>10} {'Bytes':>12} {'AI':>9} "
+    print(f"  {'seq_len':>8} {'FLOPs':>12} {'每 token':>10} {'Bytes':>12} {'AI':>9} "
           f"{'t_mem':>9} {'t_compute@40%':>14}")
-    for T in (256, 1024, 4096, 16384, 65536, 131072, 262144):
-        f = flops_prefill(d, T)
-        by = pre_w + bytes_prefill_activations(d, T) + kv_tok * T
-        print(f"  {T:>8} {rate(f['total']):>12} {rate(f['per_token']):>10} {rate(by):>12} "
+    for seq_len in (256, 1024, 4096, 16384, 65536, 131072, 262144):
+        f = flops_prefill(d, seq_len)
+        by = pre_w + bytes_prefill_activations(d, seq_len) + kv_tok * seq_len
+        print(f"  {seq_len:>8} {rate(f['total']):>12} {rate(f['per_token']):>10} {rate(by):>12} "
               f"{f['total'] / by:>9.2f} {by / peak_bw * 1e3:>7.2f}ms "
               f"{f['total'] / (peak_flops * 0.4) * 1e3:>12.1f}ms")
     print()
     print("  decode 1 token（只读 top-k 专家）")
-    print(f"  {'C':>8} {'FLOPs':>12} {'Bytes':>12} {'AI':>9} {'t_mem':>9} "
+    print(f"  {'kv_len':>8} {'FLOPs':>12} {'Bytes':>12} {'AI':>9} {'t_mem':>9} "
           f"{'t_compute@40%':>14} {'tok/s 上限':>12}")
-    for C in (0, 1024, 8192, 32768, 65536, 131072, 262144):
-        f = flops_decode(d, C)
-        by = dec_w + act_dec + bytes_kv_at(d, C)
-        print(f"  {C:>8} {rate(f['total']):>12} {rate(by):>12} {f['total'] / by:>9.2f} "
+    for kv_len in (0, 1024, 8192, 32768, 65536, 131072, 262144):
+        f = flops_decode(d, kv_len)
+        by = dec_w + act_dec + bytes_kv_at(d, kv_len)
+        print(f"  {kv_len:>8} {rate(f['total']):>12} {rate(by):>12} {f['total'] / by:>9.2f} "
               f"{by / peak_bw * 1e3:>7.2f}ms {f['total'] / (peak_flops * 0.4) * 1e3:>12.3f}ms "
               f"{peak_bw / by * 1:>10.1f}")
 

@@ -87,8 +87,11 @@ llm/
 ├── hy3/
 │   ├── architecture.md       # HY3 架构 + shape + 参数/FLOPs/访存
 │   ├── config.json           # 官方 config（唯一真源）
+│   ├── shapes.py             # 只读 config 的 shape 流水
 │   ├── accounting.py         # 只读 config 的纸面账本
-│   └── runs/accounting.log   # 原始输出
+│   ├── accounting.log        # 参数/FLOPs/访存账本
+│   └── runs/
+│       └── hy3_shapes.log    # shape 流水（prefill + decode）
 ├── hy4/
 │   ├── README.md             # HY4 入口：结论 + 文件导航
 │   ├── architecture.md       # 结构、shape、参数、FLOPs、KV cache
@@ -134,7 +137,9 @@ llm/
 不做：Llama 权重、DeepSeek-V4.1-Flash。
 
 HY3 的 L2 标 `—`：权重 BF16 约 597.6 GB，这台 16 GB 的 M4 装不下，也没有 8 卡机器。
-能做的是 L1（架构 + shape）和 L3a（纸面账本）；MTP 的 3.8B 权重也包含在 checkpoint 里。
+能做的是 L1（架构 + shape）和 L3a（纸面账本）；`hy3/shapes.py` 用真实 config 维度做了
+prefill + decode 的 shape 推演，日志在 `hy3/runs/hy3_shapes.log`，但没有真实权重前向。
+MTP 的 3.8B 权重也包含在 checkpoint 里。
 
 为什么第 1 档是 GPT-2 124M：
 
@@ -177,20 +182,21 @@ decode 每生成一个 token 都要把 249 MB 权重读一遍 —— 这就是�
 
 ## 已知数：HY3
 
-纯纸面算，权重没下载。账本在 `hy3/runs/accounting.log`，所有数字由 `hy3/accounting.py`
+纯纸面算，权重没下载。shape 流水在 `hy3/runs/hy3_shapes.log`，账本在
+`hy3/accounting.log`；所有数字由 `hy3/shapes.py` 和 `hy3/accounting.py`
 只读 `hy3/config.json` 生成：
 
 | 项 | 值 |
 | --- | --- |
 | 参数（主干 / 含 MTP） | 295,033,528,320（295.03B）/ 298,786,140,416（298.79B） |
 | 激活参数 | 20,675,715,072（20.68B） |
-| prefill `T=4096` | 209.8T FLOPs（51.2G / token） |
-| decode `C=0` | 40.4G FLOPs / token |
-| decode `C=128K` | 387.3G FLOPs / token |
+| prefill `seq_len=4096` | 209.8T FLOPs（51.2G / token） |
+| decode `kv_len=0` | 40.4G FLOPs / token |
+| decode `kv_len=128K` | 387.3G FLOPs / token |
 | 权重（BF16） | 590.07 GB（含 MTP 597.57 GB） |
 | decode 权重 / token | 40.36 GB（只读 top-8 专家） |
 | KV cache | 320 KiB / token；256K 上下文 = 80 GiB |
-| decode 算术强度 | 1.00 FLOP/B（C=0）→ 带宽瓶颈 |
+| decode 算术强度 | 1.00 FLOP/B（kv_len=0）→ 带宽瓶颈 |
 
 含 MTP 的 298,786,140,416 和 HF safetensors 的 BF16 计数**逐位相等**，
 说明 config 没抄错、MTP 没重复算 embedding/lm_head。
@@ -234,8 +240,9 @@ L1 / L2 / L3a 都能做。L3b 等换机器：只需测本机的两个常数（�
 - [x] GPT-2 `model.py` + `runs/gpt2_shapes.log`（prefill + decode 都有）
 - [x] GPT-2 的 L1：单栈、causal mask、KV cache、参数量/FLOPs/访存
 - [x] HY3：config + 架构 + 参数/FLOPs/访存账本（`llm/hy3/`）
+- [x] HY3 的 shape 流水：`shapes.py` + `runs/hy3_shapes.log`（prefill + decode，真实 config 维度）
+- [ ] HY3 的 tiny config（可选）：`hidden_size=64, num_hidden_layers=3, num_experts=8, num_experts_per_tok=2` 跑同构代码
 - [x] HY4：config + 架构 + 参数/FLOPs/访存账本（`llm/hy4/`）
 - [x] HY4-Flash：config + 架构 + 参数/FLOPs/访存账本（`llm/hy4_flash/`）
-- [ ] HY3 的 tiny config：`H=64, L=3, E=8, top_k=2` 跑同构代码，验证 shape
 - [x] HY4-Flash 的 L1 架构文档（`llm/hy4_flash/architecture.md`）
 - [ ] L3b：换机器后跑 profiler，把 `实测 t / 倍数` 填进账表
