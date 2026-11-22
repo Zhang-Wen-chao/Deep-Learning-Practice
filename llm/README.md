@@ -172,8 +172,6 @@ DSA / MoE / iHC 之类）不单独设一档，直接在真实 config 上逐个�
 | decode 权重 | 249 MB（FP16；FP32 约 498 MB） |
 | KV cache `T=1024` | 38 MB（FP16） |
 
-> 之前写的 `124,402,944` 少了 12 层 `c_fc` 的 bias（`12 × 3072 = 36,864`）。以真实 `state_dict` 的 **124,439,808** 为准。
-
 decode 每生成一个 token 都要把 249 MB 权重读一遍 —— 这就是带宽瓶颈的来源，
 也是为什么 decode 要看字节而不是 FLOPs。
 
