@@ -4,15 +4,10 @@
 
 ## 项目结构
 
-### 📊 quantization/ - 神经网络量化
-- PyTorch 量化教程
-- NVIDIA PyTorch Quantization 实践
-- 量化算法研究与实现
-
-### 👁️ computer-vision/ - 计算机视觉
-- OpenCV Python 实践
-- Cell Painting 数据分析
-- 计算机视觉项目
+### 🧠 llm/ - 大模型
+- Transformer 形状流向（shape flow）
+- BERT / GPT / 原版架构对照
+- 从 shape 推到参数量、计算量与量化位置
 
 ## 技术栈
 
