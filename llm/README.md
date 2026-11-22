@@ -76,22 +76,24 @@ llm/
 │   └── runs/model_py_flow.log
 ├── gpt/
 │   ├── architecture.md       # GPT-2 架构 + shape + 参数/FLOPs/KV cache
+│   ├── config.json           # HF 官方 config（shape 的唯一真源）
 │   ├── model.py              # 自写 GPT-2，加载 HF 权重，prefill + decode
 │   └── runs/gpt2_shapes.log
 ├── bert/
 │   ├── architecture.md       # BERT 架构图 + shape + 参数/FLOPs/访存
+│   ├── config.json           # HF 官方 config（shape 的唯一真源）
 │   ├── model.py              # 自写 encoder-only，加载 bert-base-uncased
 │   └── runs/bert_flow.log
 ├── hy3/
-│   ├── README.md             # HY3 架构 + shape + 参数/FLOPs/访存
+│   ├── architecture.md       # HY3 架构 + shape + 参数/FLOPs/访存
 │   ├── config.json           # 官方 config（唯一真源）
 │   ├── accounting.py         # 只读 config 的纸面账本
 │   └── runs/accounting.log   # 原始输出
 ├── hy4/
-│   ├── README.md             # HY4-preview 入口：结论 + 文件导航
+│   ├── README.md             # HY4 入口：结论 + 文件导航
 │   ├── architecture.md       # 结构、shape、参数、FLOPs、KV cache
 │   ├── calc.py               # 只读 config 的账本
-│   ├── configs/hy4-preview.json
+│   ├── config.json           # tencent/Hy4 config（唯一真源）
 │   └── runs/calc.log
 └── hy4_flash/
     ├── README.md             # HY4-Flash 结论 + config 速查 + 代码链接
@@ -125,7 +127,7 @@ llm/
 | 0 | **Transformer 2017**（enc-dec） | 地基：MHA + FFN + 残差 + LN + 位置编码 | ✅ | ✅ | ✅ | [ ] |
 | 1 | **GPT-2 124M** | decoder-only；删掉 encoder 和 cross-attn；学习式位置编码；weight tying | ✅ | ✅ | ✅ | [ ] |
 | 2 | **HY3**（295B MoE） | MoE 192选8 + shared；GQA 64/8；QK-Norm；SwiGLU；RoPE；MTP | ✅ | — | ✅ | [ ] |
-| 3 | **HY4**（770B MoE） | Gated MLA + DSA + iHC + 256选8 + MTP；MLA 把 KV 压到 93KiB/token | ✅ | — | ✅ | [ ] |
+| 3 | **HY4**（774B，多模态） | Gated MLA + DSA + iHC + 256选8；ViT 1.23B + DFly2 3.3B；MLA 把 KV 压到 93KiB/token | ✅ | — | ✅ | [ ] |
 | 4 | **HY4-Flash**（220B） | 12 层 DSA + 30 层 SWA；LatentMoE 512选16；Engram；ViT；DFly2 | ✅ | — | ✅ | [ ] |
 | — | **BERT-base**（旁支） | encoder-only；双向、无 causal mask；可学习位置；三种 embedding；MLM 头 | ✅ | ✅ | ✅ | [ ] |
 
@@ -155,7 +157,7 @@ GPT-1 和 GPT-2 是同一套 decoder block，不单独设档；GPT-2 的 medium/
 DSA / MoE / iHC 之类）不单独设一档，直接在真实 config 上逐个对：
 
 - `llm/hy3/`：295B MoE，GQA + QK-Norm + SwiGLU + RoPE + MTP；
-- `llm/hy4/`：770B MoE，Gated MLA + DSA + iHC；
+- `llm/hy4/`：774B 多模态，Gated MLA + DSA + iHC + ViT + DFly2；
 - `llm/hy4_flash/`：220B，混合 SWA/DSA + LatentMoE + Engram + ViT + DFly2。
 
 ## 已知数：GPT-2 124M
@@ -200,17 +202,17 @@ decode 每生成一个 token 都要把 249 MB 权重读一遍 —— 这就是�
 纯纸面算，权重没下载。HY4 的账本在 `hy4/runs/calc.log`，Flash 在
 `hy4_flash/runs/accounting.log`：
 
-| 项 | HY4（preview） | HY4-Flash |
+| 项 | HY4（正式版） | HY4-Flash |
 | --- | --- | --- |
-| checkpoint 参数 | 779.96B（769.91B + 10.05B MTP） | 220.25B（含 Engram 63.46B） |
-| 激活 / token | 49.06B | 11.27B（text） |
+| checkpoint 参数 | 774.43B（769.91B text + 1.23B ViT + 3.30B DFly2） | 220.25B（含 Engram 63.46B） |
+| 激活 / token | 49.06B text（有图 +1.23B） | 11.27B（text） |
 | prefill | 107.45G FLOPs/token（S=2K） | 24.14G FLOPs/token（S=4K） |
 | decode | 107.45G FLOPs/token（C=2K） | 25.98G FLOPs/token（C=128K） |
 | decode 权重 / token | 89.99GiB（BF16） | 21.68GiB（含 fp32 lm_head） |
 | KV / token | 93.0KiB（全历史） | 50.25KiB（上界）/ 16.50KiB（HF 默认） |
 | 算术强度 | 1.11（C=2K） | 0.91–21.0（HF 默认；看上下文/是否含池化） |
 
-HY4 的 checkpoint `779,960,992,733` 和 HF safetensors **逐位相等**，MTP 10.054B
+HY4 的 checkpoint `774,434,002,142` 和 HF safetensors **逐位相等**，DFly2 3.297B
 是残差；Flash 的 `220,255,011,261`（DFly2=0.85B 口径）和 `220,251,201,958`
 差 0.0017%。
 
@@ -226,7 +228,7 @@ Apple M4 / 16 GB / arm64 / 无 CUDA / MPS 可用 / transformers 装在 ~/.venvs/
 
 L1 / L2 / L3a 都能做。L3b 等换机器：只需测本机的两个常数（可达算力、可达带宽），
 再跑一遍 profiler 填实测列。HY3 / HY4 / HY4-Flash 是例外：权重分别是 597.6 GB、
-1.56 TB、440 GB，本机 L2 都做不了，只做 L1 + L3a。
+1.55 TB、440 GB，本机 L2 都做不了，只做 L1 + L3a。
 
 ## 下一步
 
@@ -234,7 +236,7 @@ L1 / L2 / L3a 都能做。L3b 等换机器：只需测本机的两个常数（�
 - [x] GPT-2 `model.py` + `runs/gpt2_shapes.log`（prefill + decode 都有）
 - [x] GPT-2 的 L1：单栈、causal mask、KV cache、参数量/FLOPs/访存
 - [x] HY3：config + 架构 + 参数/FLOPs/访存账本（`llm/hy3/`）
-- [x] HY4-preview：config + 架构 + 参数/FLOPs/访存账本（`llm/hy4/`）
+- [x] HY4：config + 架构 + 参数/FLOPs/访存账本（`llm/hy4/`）
 - [x] HY4-Flash：config + 架构 + 参数/FLOPs/访存账本（`llm/hy4_flash/`）
 - [ ] HY3 的 tiny config：`H=64, L=3, E=8, top_k=2` 跑同构代码，验证 shape
 - [x] HY4-Flash 的 L1 架构文档（`llm/hy4_flash/architecture.md`）

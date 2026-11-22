@@ -1,6 +1,6 @@
 # GPT-2（124M）
 
-## 它解决什么问题
+## 1. 任务
 
 GPT-2 做的是**下一 token 预测**：给一段文本，预测下一个 token；把预测接回输入，重复，就是生成。
 
@@ -14,20 +14,7 @@ GPT-2 做的是**下一 token 预测**：给一段文本，预测下一个 token
 训练时整句喂进去，每个位置都预测下一个 token；推理时一个 token 一个 token 往后接。
 训练和推理的 shape 在 prefill 阶段相同，差别在 decode 阶段：`q_len = 1`，并且要带 KV cache。
 
-GPT-2 124M 的配置：
-
-| 名字 | 值 |
-| --- | --- |
-| `vocab_size` | 50257 |
-| `dim_model` | 768 |
-| `num_layers` | 12 |
-| `num_heads` | 12 |
-| `dim_k` | 64（768 / 12） |
-| `dim_ff` | 3072（4 × 768） |
-| `max_pos` | 1024 |
-| 参数 | **124,439,808** |
-
-## 记号
+## 2. 记号
 
 和 Transformer 那篇相同的部分不再重复，只列 GPT-2 新出现的：
 
@@ -41,7 +28,22 @@ GPT-2 124M 的配置：
 | `wte` / `wpe` | token embedding / 可学习位置 embedding |
 | KV cache | decode 时缓存每层历史 K/V，避免重算 |
 
-## 怎么读图
+GPT-2 124M 的配置。本地 [`config.json`](config.json) 是 Hugging Face 官方 config 的副本，`model.py` 直接读它；下表是字段映射：
+
+| 名字 | 值 | `config.json` 字段 |
+| --- | --- | --- |
+| `vocab_size` | 50257 | `vocab_size` |
+| `dim_model` | 768 | `n_embd` |
+| `num_layers` | 12 | `n_layer` |
+| `num_heads` | 12 | `n_head` |
+| `dim_k` | 64 | `n_embd / n_head` |
+| `dim_ff` | 3072 | `n_inner`（null → `4 × n_embd`） |
+| `max_pos` | 1024 | `n_positions` / `n_ctx` |
+| 参数 | **124,439,808** | 由真实 `state_dict` 数出 |
+
+## 3. 结构
+
+### 3.1 怎么读图
 
 和 Transformer 那篇的图例一致：
 
@@ -53,7 +55,7 @@ GPT-2 124M 的配置：
 | `(+)` 圆圈 | 逐元素相加 |
 | `× N` | 重复 N 次，每层权重独立，形状不变 |
 
-## GPT 单栈
+### 3.2 GPT 单栈
 
 同一套零件，删掉 encoder 和 cross-attention 之后的样子：
 
@@ -93,7 +95,69 @@ flowchart TB
 | FFN 激活 | ReLU | GELU（tanh 近似） |
 | Q/K/V | 三个独立 Linear | 一个 `c_attn`（768→2304），再切 |
 
-## causal mask
+### 3.3 c_attn 和 wte / wpe
+
+这三个名字来自 GPT-2 的实现，不是论文里的数学符号。图里出现过，这里拆开看。
+
+#### c_attn：一次算出 Q/K/V
+
+Transformer 写三个独立的 Linear：
+
+```python
+q = q_proj(x)   # 768 → 768
+k = k_proj(x)
+v = v_proj(x)
+```
+
+GPT-2 合成一个：
+
+```python
+qkv = c_attn(x)          # (batch_size, seq_len, 2304)
+q, k, v = qkv.split(768, dim=-1)
+```
+
+`c_attn` 的权重是 `(2304, 768)`、bias 是 `(2304,)`。`2304 = 3 × 768`，按最后一维切成三段，分别就是 Q、K、V。下面用 `B = batch_size`、`T = seq_len`：
+
+| 切片 | 形状 | 是什么 |
+| --- | --- | --- |
+| `[..., :768]` | `(B, T, 768)` | Q |
+| `[..., 768:1536]` | `(B, T, 768)` | K |
+| `[..., 1536:]` | `(B, T, 768)` | V |
+
+然后再拆头：`(B, T, 768) → (B, 12, T, 64)`。
+
+数学上和三套独立 Linear 完全等价；合成一个只是少两次矩阵乘、实现更紧凑。Hugging Face 的 checkpoint 把它存成 Conv1D，权重形状是 `(768, 2304)`（in, out）；本文件的 `nn.Linear` 要 `(2304, 768)`（out, in），所以加载时转置。
+
+#### wte / wpe：两张查找表
+
+GPT-2 的第一行不是矩阵乘，是两次查表：
+
+```python
+x = wte[token_ids] + wpe[positions]
+```
+
+| 名字 | 形状 | 输入 | 输出 | 是否训练 |
+| --- | --- | --- | --- | --- |
+| `wte` | 50257 × 768 | token id | 768 维向量 | 是 |
+| `wpe` | 1024 × 768 | 位置 `0…T-1` | 768 维向量 | 是 |
+
+- `wte`：词表里每个 token 一行。`"A long time ago"` 切成 `[32, 890, 640, 2084]`，查出来就是 `(1, 4, 768)`。
+- `wpe`：每个位置一行。位置 `0, 1, 2, 3` 查出来是 `(4, 768)`，广播到 batch 维后相加，得到 `(1, 4, 768)`。
+- `wte` 和输出头 `lm_head` 共享同一个矩阵（weight tying）；`wpe` 不共享。
+- `wpe` 是可学习的，这点和 Transformer 2017 的固定 sin/cos 不同；最大 1024 个位置。
+
+所以 embedding 这一步的完整形状：
+
+```
+token_ids        (1, 4)
+wte[token_ids]   (1, 4, 768)
+wpe[0..3]        (4, 768)
+相加              (1, 4, 768)
+```
+
+> `wte` / `wpe` 是 OpenAI GPT-2 代码里的名字：**w**eight **t**oken **e**mbedding / **w**eight **p**osition **e**mbedding。Hugging Face 里叫 `transformer.wte` / `transformer.wpe`。
+
+### 3.4 causal mask
 
 GPT-2 的 self-attention 是因果的：位置 `t` 只能看 `≤ t`。
 
@@ -108,7 +172,7 @@ prefill 时 `q_len = kv_len = seq_len`，mask 是下三角（行是 q、列是 k
 
 decode 时 `q_len = 1`，新的 query 可以看全部历史 K/V，所以 `scores` 是 `(batch_size, num_heads, 1, kv_len)`，不需要再遮未来——未来还没进 cache。
 
-## prefill 和 decode
+### 3.5 prefill 和 decode
 
 `runs/gpt2_shapes.log` 是用真实 GPT-2 权重跑出来的，prompt 是 `"A long time ago"`（4 个 token）。
 
@@ -140,9 +204,11 @@ step 2: 输入 (1,1)  → K/V cache (1,12,6,64) → scores (1,12,1,6)
 每层缓存两份：K `(1, 12, kv_len, 64)` 和 V `(1, 12, kv_len, 64)`。12 层一共 24 个张量。
 cache 只存历史，不存参数；`kv_len` 从 prompt 长度开始，每生成一个 token 加 1。
 
-## 参数量
+## 4. 参数
 
-一个 block：
+### 4.1 一个 block
+
+一个 block 的参数量：
 
 | 操作 | 完整式子 | 约算 | 参数量 |
 | --- | --- | --- | --- |
@@ -160,6 +226,8 @@ cache 只存历史，不存参数；`kv_len` 从 prompt 长度开始，每生成
 768 × 3072 = (3×256) × (3×1024) = 9 × (256×1024) = 9 × 256K = 2,304K
 ```
 
+### 4.2 整个模型
+
 整个模型：
 
 | 部分 | 约算 | 参数量 |
@@ -171,13 +239,17 @@ cache 只存历史，不存参数；`kv_len` 从 prompt 长度开始，每生成
 | `lm_head` | 和 `wte` 同一个矩阵 | 0 |
 | **合计** | | **≈121.4M**（精确 124,439,808） |
 
-> 约算和精确差 2.5%，来自 K→M 的进位（除 1000 而不是 1024）。要精确值就看 `state_dict`。
+> 上表的约算混用了 1024 和 1000 的进位，只用于心算；精确值以 `state_dict` 的 **124,439,808** 为准。
 
-> 之前这里写的 `124,402,944` 少了 `12 × 3,072 = 36,864`，正好是 12 层 `c_fc` 的 bias。以 `state_dict` 的 **124,439,808** 为准。
+### 4.3 和论文的 117M 对得上吗
 
-## 计算量（FLOPs）
+GPT-2 论文 Table 2 写的是 117M / 345M / 762M / 1542M；Hugging Face 的 `gpt2` 是 **124,439,808**。两者不是同一套计数：词表、版本和四舍五入口径都可能不同。本文以 `config.json` + 真实 `state_dict` 为准，不拿论文的 117M 当精确目标。
 
-### 规则
+> 之前这里写的 `124,402,944` 少了 `12 × 3,072 = 36,864`，正好是 12 层 `c_fc` 的 bias。
+
+## 5. 计算量（FLOPs）
+
+### 5.1 规则
 
 ```
 矩阵乘 (m, k) @ (k, n) → m × k × n 次乘加，× 2 = FLOPs
@@ -185,7 +257,7 @@ cache 只存历史，不存参数；`kv_len` 从 prompt 长度开始，每生成
 
 `m` 是 token 数：prefill 时 `m = seq_len`，decode 时 `m = 1`。
 
-### 一个 Linear 展开
+### 5.2 一个 Linear 展开
 
 `c_attn`（`768 → 2304`），prefill `seq_len = 4`：
 
@@ -198,7 +270,7 @@ cache 只存历史，不存参数；`kv_len` 从 prompt 长度开始，每生成
 × 2 = 13.8M FLOPs
 ```
 
-### 一个 block（prefill `seq_len = 4`）
+### 5.3 一个 block（prefill `seq_len = 4`）
 
 | 操作 | m | k | n | 乘加 | FLOPs | 占比 |
 | --- | --- | --- | --- | --- | --- | --- |
@@ -212,7 +284,7 @@ cache 只存历史，不存参数；`kv_len` 从 prompt 长度开始，每生成
 
 **FFN 占 2/3**（`c_fc` + `c_proj` = 36.8M），注意力投影占 1/3。
 
-### 12 层 + 输出头
+### 5.4 12 层 + 输出头
 
 ```
 12 层   = 55.3M × 12              ≈ 0.66G
@@ -221,7 +293,7 @@ cache 只存历史，不存参数；`kv_len` 从 prompt 长度开始，每生成
                            合计   ≈ 0.97G（prefill 4 个 token）
 ```
 
-### decode：每生成 1 个 token
+### 5.5 decode：每生成 1 个 token
 
 `m = 1`，其余不变：
 
@@ -240,7 +312,7 @@ cache 只存历史，不存参数；`kv_len` 从 prompt 长度开始，每生成
                        合计   ≈ 243M / token
 ```
 
-### 长上下文：注意力的平方项
+### 5.6 长上下文：注意力的平方项
 
 `seq_len = T` 时，`scores` 和 `attn @ V` 两项：
 
@@ -254,9 +326,9 @@ cache 只存历史，不存参数；`kv_len` 从 prompt 长度开始，每生成
 
 权重那 243M 不随 `T` 变，只有这一项涨。
 
-## 访存量（Bytes）
+## 6. 访存量（Bytes）
 
-### 规则
+### 6.1 规则
 
 ```
 Bytes = (读入元素数 + 权重元素数 + 写出元素数) × 每元素字节
@@ -264,7 +336,7 @@ Bytes = (读入元素数 + 权重元素数 + 写出元素数) × 每元素字节
 
 decode 时读入/写出只有 768 个数，**权重是大头**，而且每步都要重读一遍。
 
-### decode：每个算子（FP32）
+### 6.2 decode：每个算子（FP32）
 
 | 操作 | 权重 | 字节 |
 | --- | --- | --- |
@@ -289,7 +361,7 @@ decode 时读入/写出只有 768 个数，**权重是大头**，而且每步都
 | FP32 | 124.4M × 4 ≈ 498M |
 | FP16 | 124.4M × 2 ≈ 249M |
 
-### KV cache
+### 6.3 KV cache
 
 不是参数，是运行时缓存。每层 K、V 各 `(T, 768)`：
 
@@ -298,7 +370,7 @@ decode 时读入/写出只有 768 个数，**权重是大头**，而且每步都
 T = 1024 → 37,748,736 B ≈ 38M
 ```
 
-### 算术强度
+### 6.4 算术强度
 
 ```
 FP16：243M FLOPs / 249M 字节 ≈ 1.0 FLOP/byte
@@ -307,7 +379,9 @@ FP16：243M FLOPs / 249M 字节 ≈ 1.0 FLOP/byte
 GPU 的 `算力/带宽` 比通常几十到几百，1.0 远低于它——**decode 是带宽瓶颈**。
 每生成一个 token 都要搬 249M 权重，算力用不满。
 
-## 论文这条线
+## 7. GPT 这条线
+
+### 7.1 论文这条线
 
 | 年份 | 论文 | 架构上有新东西吗 | 真正的贡献 |
 | --- | --- | --- | --- |
@@ -330,7 +404,7 @@ GPU 的 `算力/带宽` 比通常几十到几百，1.0 远低于它——**decod
 GPT-3 没有开放权重，读论文即可。真正该动手的是下一档 HY3——RoPE、GQA、SwiGLU、
 RMSNorm、MoE 才是新零件。
 
-## 为什么不需要 GPT-1/2/3 各写一遍
+### 7.2 为什么不需要 GPT-1/2/3 各写一遍
 
 把三者的配置摆在一起：
 
@@ -356,7 +430,7 @@ RMSNorm、MoE 才是新零件。
 真正会改变 shape 和计算量的是下一档 HY3：RoPE、GQA、SwiGLU、RMSNorm、MoE。
 如果以后想做 GPT-3 的 sparse attention，单独做一节 mask pattern 实验就行，不用建 175B。
 
-## 跑法
+## 8. 跑法
 
 需要 `torch`、`transformers`、`tiktoken`。本机把 `transformers` 装在独立 venv 里：
 

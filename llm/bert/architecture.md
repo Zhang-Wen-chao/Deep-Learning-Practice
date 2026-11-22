@@ -16,7 +16,7 @@ BERT 做的是**完形填空**（Masked Language Modeling）：盖住句子里�
 
 ## 2. 记号
 
-模型结构全在 `config.json` 里，直接用它的字段名，不再另起一套符号。
+模型结构全在 [`config.json`](config.json) 里（本目录是 Hugging Face 官方 `bert-base-uncased` 的副本），直接用它的字段名，不再另起一套符号。
 只有 `batch_size` 和 `seq_len` 是运行时才有的。
 
 | `config.json` 字段 | 值 | 是什么 |

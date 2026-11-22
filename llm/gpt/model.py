@@ -19,7 +19,9 @@
 """
 
 import argparse
+import json
 import math
+import os
 import warnings
 
 import torch
@@ -264,7 +266,30 @@ class GPT(nn.Module):
         return ids
 
 
-# ─────────────────────────────────────────────────────────── 3. 加载权重
+# ─────────────────────────────────────────────────────────── 3. 加载 config 和权重
+def load_config(path):
+    """读取 HF 的 config.json，映射成本文件的参数名。
+
+    GPT-2 的 config 字段和论文符号不是一一同名：
+        n_embd      → dim_model
+        n_head      → num_heads
+        n_layer     → num_layers
+        n_positions → max_pos
+        n_inner     → dim_ff（null 时按 4 × n_embd）
+    """
+    with open(path, encoding="utf-8") as f:
+        c = json.load(f)
+    dim = c["n_embd"]
+    return dict(
+        vocab=c["vocab_size"],
+        dim=dim,
+        heads=c["n_head"],
+        dim_ff=c.get("n_inner") or 4 * dim,
+        layers=c["n_layer"],
+        max_pos=c["n_positions"],
+    )
+
+
 def load_pretrained(model, name="gpt2"):
     """把 HF 的 GPT-2 state_dict 映射到本文件。
 
@@ -316,6 +341,7 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--prompt", default="A long time ago")
     ap.add_argument("--new", type=int, default=4)
+    ap.add_argument("--config", default=os.path.join(os.path.dirname(__file__), "config.json"))
     args = ap.parse_args()
 
     print("=" * 70)
@@ -323,8 +349,12 @@ def main():
     tok = Tokenizer()
     print(f"  GPT-2 BPE，eos = {tok.eos}")
 
-    print("\n[2] 模型 + 加载权重")
-    model = GPT()
+    print("\n[2] config + 模型 + 加载权重")
+    cfg = load_config(args.config)
+    print(f"  config: {args.config}")
+    print(f"  n_embd={cfg['dim']}  n_head={cfg['heads']}  n_layer={cfg['layers']}  "
+          f"n_positions={cfg['max_pos']}  vocab={cfg['vocab']}  n_inner={cfg['dim_ff']}")
+    model = GPT(**cfg)
     load_pretrained(model)
     model.eval()
     print(f"  参数 {sum(p.numel() for p in model.parameters()):,}")

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""HY4（Hy4-preview）的纸面账本：只读 config.json，不下载权重。
+"""HY4（tencent/Hy4，官方正式版）的纸面账本：只读 config.json，不下载权重。
 
 算三样东西：
 
@@ -36,10 +36,12 @@ G = K * M
 T = K * G
 
 # HF API 的 safetensors 元数据（只读 header，不下载权重）：
-#   https://huggingface.co/api/models/tencent/Hy4-preview
-CHECKPOINT_TOTAL = 779_960_992_733  # 770B backbone + 10B MTP
+#   https://huggingface.co/api/models/tencent/Hy4
+CHECKPOINT_TOTAL = 774_434_002_142  # text backbone + ViT + DFly2
 OFFICIAL_BACKBONE = 770e9
 OFFICIAL_ACTIVE = 49e9
+OFFICIAL_VIT = 1.23e9
+OFFICIAL_DFLY = 3.3e9
 
 
 # ─────────────────────────────────────────────────────────── 格式化
@@ -62,7 +64,7 @@ def bfmt(n):
 
 
 def row(name, value, note=""):
-    print(f"  {name:<34}{str(value):>16}  {note}")
+    print(f"  {name:<34}{str(value):>16}  {note}".rstrip())
 
 
 def section(title):
@@ -196,7 +198,7 @@ def model_params(c, expected):
     final_norm = h
     backbone = sum(x["params"] for x in layers) + embed + lm_head + hyper_head + final_norm
     checkpoint = expected
-    mtp = checkpoint - backbone
+    non_text = checkpoint - backbone
 
     return {
         "common": common,
@@ -211,7 +213,7 @@ def model_params(c, expected):
         "final_norm": final_norm,
         "backbone": backbone,
         "checkpoint": checkpoint,
-        "mtp": mtp,
+        "non_text": non_text,
     }
 
 
@@ -300,9 +302,10 @@ def bytes_decode(c, active_compute, kv_len, dtype_bytes=2):
 
 
 # ─────────────────────────────────────────────────────────── 输出
-def print_config(c):
+def print_config(full, c):
     section("1. config")
-    row("model_type", c.get("model_type", "?"))
+    row("model_type", full.get("model_type", "?"))
+    row("architectures", full.get("architectures", "?"))
     row("hidden_size", c["hidden_size"])
     row("num_hidden_layers", n_layers(c), "1 dense + %d MoE" % (n_layers(c) - 1))
     row("attention heads", c["num_attention_heads"])
@@ -311,6 +314,7 @@ def print_config(c):
         f'{c["qk_nope_head_dim"]}+{c["qk_rope_head_dim"]} = '
         f'{c["qk_nope_head_dim"] + c["qk_rope_head_dim"]}')
     row("v_head_dim", c["v_head_dim"])
+    row("qk_norm", c.get("qk_norm", False))
     row("DSA top-k", c["index_topk"])
     row("indexer", f'{c["index_n_heads"]} heads × {c["index_head_dim"]}')
     row("full indexer layers", sum(full_indexer_flags(c)), "shared 层复用 top-k")
@@ -320,6 +324,15 @@ def print_config(c):
     row("vocab_size", c["vocab_size"])
     row("iHC streams", c["hc_mult"])
     row("context", c["max_position_embeddings"])
+    if full.get("vision_config"):
+        v = full["vision_config"]
+        row("vision", f'{v["num_hidden_layers"]} 层 / {v["hidden_size"]} 宽',
+            f'FFN {v["intermediate_size"]}，patch {v["patch_size"]}')
+        row("vision out_hidden", v["out_hidden_size"])
+    if full.get("dfly_num_hidden_layers"):
+        row("DFly2", f'{full["dfly_num_hidden_layers"]} 层草稿',
+            f'target layers {full.get("dfly_target_kv_layers")}')
+    row("MTP layers", c.get("num_nextn_predict_layers", 0), "正式版没有 MTP")
 
 
 def print_params(c, p):
@@ -337,20 +350,25 @@ def print_params(c, p):
     row("  embedding", nfmt(p["embed"]), "120832 × 6144")
     row("  lm_head", nfmt(p["lm_head"]), "独立权重，不 tying")
     row("  final norm + HC head", nfmt(p["final_norm"] + p["hyper_head"]))
-    row("backbone 合计", nfmt(p["backbone"]),
+    row("text backbone", nfmt(p["backbone"]),
         f'官方 770B，差 {(p["backbone"] / OFFICIAL_BACKBONE - 1) * 100:+.3f}%')
-    row("MTP 残差", nfmt(p["mtp"]), "checkpoint − backbone，官方 10B")
+    row("+ ViT", nfmt(OFFICIAL_VIT), "官方 1.23B（有图时激活）")
+    row("+ DFly2", nfmt(p["non_text"] - OFFICIAL_VIT), "checkpoint 反推，官方 3.3B")
     row("checkpoint 合计", nfmt(p["checkpoint"]), "HF safetensors 精确值")
+    row("非 text 合计", nfmt(p["non_text"]), "ViT + DFly2")
 
 
-def print_active(c, a):
+def print_active(c, a, full=None):
     section("3. 激活参数量（每 token）")
-    row("全部层激活之和", nfmt(a["active"]),
+    row("text 激活之和", nfmt(a["active"]),
         f'官方 49B，差 {(a["active"] / OFFICIAL_ACTIVE - 1) * 100:+.2f}%')
     row("  其中 MoE 单层激活", nfmt(a["active_moe"]), "top-8 专家 + 共享 + router")
     row("  减去 embedding 查表", "-" + nfmt(c["vocab_size"] * c["hidden_size"]),
         "查表不产生 FLOP")
-    row("参与乘加的激活参数", nfmt(a["active_compute"]), "FLOPs / Bytes 用这个")
+    row("参与乘加的 text 激活", nfmt(a["active_compute"]), "FLOPs / Bytes 用这个")
+    if full and full.get("vision_config"):
+        row("+ Vision（有图时）", nfmt(OFFICIAL_VIT), "官方 1.23B")
+        row("text + vision", nfmt(a["active"] + OFFICIAL_VIT), "官方 50B 量级")
 
 
 def print_kv(kv):
@@ -379,7 +397,7 @@ def print_prefill(c, p, a, seq_len):
     row("  indexer 打分", nfmt(f["idx_core"]), "21 个 full 层")
     row("  每 token 合计", nfmt(f["total"]), "GFLOPs")
     row("  整段合计", nfmt(total_flops), "FLOPs")
-    row("  全量权重（全专家）", bfmt(full_weights), "1.54TB 量级，prefill 读一遍")
+    row("  text 全量权重（全专家）", bfmt(full_weights), "1.54TB 量级，prefill 读一遍")
     row("  KV 读写（causal 折半）", bfmt(kv_traffic), "S × 每 token 选中 KV / 2")
     row("  整段总字节", bfmt(total_bytes))
     row("  算术强度", f'{total_flops / total_bytes:.1f}', "FLOPs / Byte，和硬件算力/带宽比")
@@ -393,7 +411,7 @@ def print_decode(c, a, decode_kv):
     row("  attention 核心", nfmt(f["attn_core"]), f'每层 top-k = {f["lk"]}')
     row("  indexer 打分", nfmt(f["idx_core"]), "扫满 KV")
     row("  每 token 合计", nfmt(f["total"]), "GFLOPs")
-    row("  权重字节", bfmt(b["weights"]), "MoE 只读 top-8")
+    row("  text 权重字节", bfmt(b["weights"]), "MoE 只读 top-8")
     row("  选中 KV + indexer", bfmt(b["selected_kv"] + b["index_scan"]))
     row("  每 token 字节", bfmt(b["total"]))
     row("  算术强度", f'{f["total"] / b["total"]:.2f}',
@@ -412,15 +430,19 @@ def print_decode(c, a, decode_kv):
 def main():
     here = os.path.dirname(os.path.abspath(__file__))
     ap = argparse.ArgumentParser()
-    ap.add_argument("--config", default=os.path.join(here, "configs", "hy4-preview.json"))
+    ap.add_argument("--config", default=os.path.join(here, "config.json"))
     ap.add_argument("--seq-len", type=int, default=2048)
     ap.add_argument("--decode-kv", type=int, default=2048)
     args = ap.parse_args()
 
     with open(args.config) as f:
-        c = json.load(f)
-    if c.get("model_type") != "hy_v4":
-        raise SystemExit(f"不是 HY4-preview config: {c.get('model_type')}；"
+        full = json.load(f)
+    if full.get("model_type") == "hy_v4_vl":
+        c = full["text_config"]
+    elif full.get("model_type") == "hy_v4":
+        c = full
+    else:
+        raise SystemExit(f"不是 HY4 config: {full.get('model_type')}；"
                          "HY4-Flash 用 llm/hy4_flash/accounting.py")
 
     print("=" * 78)
@@ -432,9 +454,9 @@ def main():
     a = active_params(c, p)
     kv = kv_cache(c)
 
-    print_config(c)
+    print_config(full, c)
     print_params(c, p)
-    print_active(c, a)
+    print_active(c, a, full)
     print_kv(kv)
 
     section("5. FLOPs / Bytes")

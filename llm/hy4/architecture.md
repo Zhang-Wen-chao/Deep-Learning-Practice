@@ -1,8 +1,9 @@
 # HY4 架构与账本
 
-> 对象：`tencent/Hy4-preview`（2026-08-28 开源权重）。
-> 方法：只读 `config.json` 和 Hugging Face transformers 的建模代码，**不下载权重**。
-> 结论：**770B 总参 / 49B 激活 / 78 层 / 1M context**。本机只能做 L1 + L3a，L2 不可行。
+> 对象：`tencent/Hy4`（正式版，2026-11-20 权重）。
+> 方法：只读 `config.json` 和 vLLM / transformers 的建模代码，**不下载权重**。
+> 结论：**774.434B checkpoint（770B text + 1.23B ViT + 3.3B DFly2）/
+> 49B text active / 78 层 / 1M context**。本机只能做 L1 + L3a，L2 不可行。
 
 ## 0. 先回答三个问题
 
@@ -10,18 +11,19 @@
 
 | 位置 | 内容 |
 | --- | --- |
-| `huggingface/transformers` → `src/transformers/models/hy_v4/` | `configuration_hy_v4.py`、`modeling_hy_v4.py`（946 行，最干净的参考实现） |
-| `vllm-project/vllm` → `vllm/models/hy_v4/` | 推理实现：MLA / DSA / iHC / MoE / MTP / FlashMLA sparse |
+| `huggingface/transformers` → `src/transformers/models/hy_v4/` | 文本主干参考实现（`HYV4ForCausalLM`） |
+| `vllm-project/vllm` → `vllm/models/hy_v4/` | 推理实现：MLA / DSA / iHC / MoE / VL / DFly |
 | `sgl-project/sglang` → `python/sglang/srt/models/hunyuan_v4.py` | 另一份推理实现，可交叉对照 |
-| `Tencent-Hunyuan/Hy4-preview` | 官方仓库，只有微调和部署，没有建模代码 |
+| `Tencent-Hunyuan/Hy4` | 官方仓库：微调、部署、DFly2 说明 |
 
 **权重需要下载吗？** 不需要。参数、FLOPs、KV cache 全部能由 `config.json` 推出来。
 本文的总参数还和 HF safetensors 的 header 总数对过账：
 
 ```
-checkpoint 总参数 = 779,960,992,733
-                  = 769,907,389,085（backbone）
-                  +  10,053,603,648（MTP）
+checkpoint 总参数 = 774,434,002,142
+                  = 769,907,389,085（text backbone）
+                  + 1,230,000,000（ViT，官方 1.23B）
+                  + 3,296,613,057（DFly2，checkpoint 残差；官方 3.3B）
 ```
 
 **和 GPT-2 那一档差在哪？** 不是“层数多一点”。HY4 换了四个零件：
@@ -54,7 +56,11 @@ checkpoint 总参数 = 779,960,992,733
 | `hc_mult` | 4 | iHC 的残差流数 |
 | `vocab_size` | 120832 | 词表 |
 | `max_position_embeddings` | 1048576 | 1M context |
-| `num_nextn_predict_layers` | 1 | MTP 层，10B 参数，投机解码用 |
+| `qk_norm` | true | config 开关；checkpoint 里没有额外 q/k norm 可学习张量（只有 `indexer.k_norm`） |
+| `rope_parameters` | mRoPE, `mrope_section [12,10,10]` | 3D 时间/高/宽位置 |
+| `num_nextn_predict_layers` | **0** | 正式版没有 MTP |
+| `vision_config` | 40 层 / 1536 宽 / patch 16 | SigLIP2 式 ViT，输出 6144 |
+| `dfly_num_hidden_layers` | 5 | DFly2 草稿模型，3.3B |
 
 `indexer_types` 的真实分布：
 
@@ -72,9 +78,11 @@ shared 层没有 indexer 模块，直接复用上一个 full 层的 top-k indice
 | 栈 | Enc×N + Dec×N | Dec×N | Dec×78 |
 | 注意力 | MHA | MHA | **Gated MLA + DSA** |
 | mask | 下三角 | 下三角 | 下三角 + top-2048 稀疏 |
-| 位置 | sin/cos 相加 | 可学习绝对位置 | **RoPE（只转 64 维）** |
+| 位置 | sin/cos 相加 | 可学习绝对位置 | **mRoPE（3D，只转 64 维）** |
 | FFN | 2 层 4× | 2 层 4× | **1 层 dense + 77 层 MoE** |
 | 残差 | 1 条 | 1 条 | **iHC 4 条** |
+| 输入 | 文本 | 文本 | **文本 + 图像/视频** |
+| 额外 | — | — | **ViT 1.23B + DFly2 3.3B** |
 | 输出头 | 词表 softmax | 词表 softmax，tied | 词表 softmax，**不 tied** |
 | KV cache / token | `2·H·d_k` | `2·H·d_k` | **576 维 latent** |
 
@@ -337,29 +345,48 @@ lm_head 6144 → 120832              (B,S,120832)
 **prefill 时 2048 个 token 基本会碰到全部 256 个专家**，所以权重按全量读；
 decode 每个 token 只读 top-8 专家。两张账不要混。
 
-### 4.9 MTP：主前向之外的第 79 层
+### 4.9 DFly2：不是第 79 层，是并行草稿模型
 
-`num_nextn_predict_layers=1`，checkpoint 里还有一层 MTP（Multi-Token Prediction），
-只用于投机解码，不在普通 `forward` 的 78 层里：
+正式版 `num_nextn_predict_layers=0`，**没有 MTP**。checkpoint 比 text backbone 多出来的
+3.3B 是 **DFly2**（5 层 dense 草稿模型），只用于投机解码：
 
 ```
-上一层 hidden + 当前 token embedding
-  enorm / hnorm（两个 RMSNorm）
-  concat (B,S,12288)
-  eh_proj 12288 → 6144
-  1 个 MoE decoder block（无 iHC）
-  shared head（复用 target 的 lm_head）
+主模型 78 层                              DFly2 5 层
+  layer 61  ── KV cache + top-2048 indices ──→ draft layer 0
+  layer 65  ── KV cache + top-2048 indices ──→ draft layer 1
+  layer 69  ── KV cache + top-2048 indices ──→ draft layer 2
+  layer 73  ── KV cache + top-2048 indices ──→ draft layer 3
+  layer 77  ── KV cache + top-2048 indices ──→ draft layer 4
 ```
 
-它不是“第 79 层主干”，而是 draft model：一次猜多个 token，再由主模型验证。
-所以：
+三个关键点：
 
-- 参数账：checkpoint 比 backbone 多 **10.054B**，主要就是这层 MoE + `eh_proj`；
-- 计算账：普通 decode 不算它；开了投机解码才会多一份 draft 成本；
-- shape 账：输入是 `(B,S,6144)`，不是 4 条 iHC 流（MTP 关掉了 iHC）。
+- **KV Share**：每个 draft 层直接复用主模型对应 DSA 层的 KV cache，不另存一份；
+- **Index Share**：复用 indexer 选出的 top-2048 个位置，所以 draft token 的
+  attention 成本与上下文长度无关；
+- **不参与 prefill**：PD 分离时只多传一个末层 hidden state，decode 阶段才启动。
 
-HF 的 `HYV4ForCausalLM` 不实例化 MTP，vLLM 的 `HYV4MTP` 才实现它。这也是为什么
-`config.json` 里只能看到 `num_nextn_predict_layers=1`，看不到 MTP 的逐层字段。
+参数账：DFly2 ≈ **3.297B**（checkpoint 反推，官方 3.3B）；普通 decode 不算它，
+开了投机解码才多一份 draft 成本。config 里对应
+`dfly_num_hidden_layers=5`、`dfly_mlp_type=dense`、
+`dfly_target_kv_layers=[61,65,69,73,77]`。
+
+### 4.10 ViT：图像怎么变成 token
+
+正式版支持图像/视频，视觉侧是一个 40 层的 ViT：
+
+```
+image (H,W,3)
+  patch 16×16                     (H/16, W/16, 1536)
+  40 层 ViT（16 头，FFN 6144）      (H/16, W/16, 1536)
+  patch merger（spatial_merge=2）   (H/32, W/32, 4×1536)
+  projector → 6144                 (H/32, W/32, 6144)
+```
+
+- 图像最多 **4096 个视觉 token**，视频帧同理；
+- 视觉 token 和文本 token 直接拼成一条 `(B,S,6144)` 序列，进同一个 78 层主干；
+- **没有单独的视觉 KV cache**：视觉 token 和文本 token 一样按 576 维/层缓存；
+- ViT 只在有图/视频时激活，参数 1.23B，权重约 2.46GB，不参与纯文本 decode。
 
 ## 5. 参数量
 
@@ -415,15 +442,20 @@ indexer   = q_lora·32·128 + h·128 + 2·128 + h·32
 | embedding | 742,391,808 |
 | lm_head | 742,391,808 |
 | final norm + HC head | 104,453 |
-| **backbone** | **769,907,389,085 ≈ 769.907B** |
-| MTP（1 层，10B 级） | 10,053,603,648 |
-| **checkpoint** | **779,960,992,733 ≈ 779.961B** |
+| **text backbone** | **769,907,389,085 ≈ 769.907B** |
+| ViT | 1,230,000,000（官方 1.23B） |
+| DFly2 | 3,296,613,057（checkpoint 残差；官方 3.3B） |
+| **checkpoint** | **774,434,002,142 ≈ 774.434B** |
 
 和官方口径：
 
-- 官方说 backbone **770B**，这里算 **769.907B**，差 0.012%；
-- 官方说 MTP **10B**，残差 **10.054B**；
-- HF safetensors 的精确总数 **779,960,992,733**，和上表最后一行逐位相等。
+- 官方说 text backbone **770B**，这里算 **769.907B**，差 0.012%；
+- 官方说 ViT **1.23B**，这里按官方数；
+- 官方说 DFly2 **3.3B**，残差 **3.297B**；
+- HF safetensors 的精确总数 **774,434,002,142**，和上表最后一行逐位相等。
+
+> `qk_norm=true` 在 checkpoint 里没有额外的 q/k norm 可学习张量（只有
+> `indexer.k_norm`），所以文本侧的逐层公式和 preview 版完全一样。
 
 MoE 占了绝对大头：
 
@@ -448,13 +480,21 @@ embedding + lm_head    742.392M × 2    =  1.485B
                                           49.057B
 ```
 
-官方说 **49B active**，对得上。其中 embedding 只是查表，不产生乘加；把它扣掉：
+官方说 **text 49B active**，对得上。其中 embedding 只是查表，不产生乘加；把它扣掉：
 
 ```
-参与乘加的激活参数 = 49.057B − 0.742B = 48.315B
+参与乘加的 text 激活参数 = 49.057B − 0.742B = 48.315B
 ```
 
 后面的 FLOPs 和 decode 字节都用 48.315B。
+
+有图像/视频输入时，ViT 还会激活 **1.23B**：
+
+```
+text 49.057B + Vision 1.230B = 50.287B
+```
+
+DFly2 只在投机解码时启动，不算进主模型的每 token 激活。
 
 ## 6. FLOPs
 
@@ -576,7 +616,7 @@ decode 每个 token 要把**这个 token 真正用到的权重**读一遍：
 48.315B × 2B = 96.63GB = 89.994GiB
 ```
 
-其中 MoE 只读 top-8 专家（不是 256 个全读），所以不是 1.56TB。
+其中 MoE 只读 top-8 专家（不是 256 个全读），所以不是 1.55TB 的 checkpoint。
 除此之外还要读 KV：
 
 ```
@@ -608,18 +648,27 @@ indexer 扫全表：        21 × T × 128 × 2B
 
 实际还要打 MFU、kernel launch、MoE all-to-all 等折扣。
 
+以上是 **text-only decode**。两个例外：
+
+- **图像/视频 prefill**：ViT 额外激活 1.23B，权重约 2.46GB；视觉 token 进入文本
+  主干后，KV 仍按 576 维/token/层计算，没有单独的视觉 KV。
+- **DFly2 投机解码**：多 3.3B 草稿权重（约 6.6GB），但每个 draft token 只读
+  复用的 2K KV，成本与上下文长度无关；不改变主模型每 token 的 90GiB 权重账。
+
 ### 7.3 prefill 的账不一样
 
 prefill 一次处理 2048 个 token，基本会碰到全部 256 个专家，所以权重按**全量**
 读一次，而不是 top-8：
 
 ```
-全量 backbone 权重 = 769.907B × 2B = 1.540TB = 1.400TiB
+全量 text backbone 权重 = 769.907B × 2B = 1.540TB = 1.400TiB
 KV 读写（causal 折半） = 186.0GiB
 整段总字节 ≈ 1.582TiB
 整段 FLOPs = 220.066T
 算术强度 ≈ 126.5 FLOPs/Byte
 ```
+
+图像 prefill 还要读 ViT 的 2.46GB，但相对 1.5TB 文本权重是零头。
 
 `126.5 < 281`，所以在 2K prefill 时**权重读取仍然占重要位置**；序列再长，
 FLOPs 线性涨、权重不变，算术强度会超过硬件的 `算力/带宽`，进入 compute-bound。
@@ -638,22 +687,24 @@ FLOPs 线性涨、权重不变，算术强度会超过硬件的 `算力/带宽`�
 
 | 检查 | 结果 |
 | --- | --- |
-| backbone 参数 vs 官方 770B | 769.907B，差 0.012% |
-| checkpoint 参数 vs HF safetensors | 779,960,992,733，逐位相等 |
-| MTP 残差 vs 官方 10B | 10.054B |
-| active 参数 vs 官方 49B | 49.057B |
+| text backbone vs 官方 770B | 769.907B，差 0.012% |
+| ViT vs 官方 1.23B | 1.230B |
+| DFly2 vs 官方 3.3B | 3.297B（checkpoint 残差） |
+| checkpoint vs HF safetensors | 774,434,002,142，逐位相等 |
+| text active vs 官方 49B | 49.057B |
 | KV / token vs 社区实测 ~95KB | 95,232B |
 | `calc.py` 两种算法 | 公式展开 / 总数对账，一致 |
 
 HF safetensors 的 dtype 分布也值得记一笔（来源：
-<https://huggingface.co/api/models/tencent/Hy4-preview>）：
+<https://huggingface.co/api/models/tencent/Hy4>）：
 
 ```
-BF16  779,930,197,312 个元素
+BF16  774,403,206,721 个元素
 F32        30,795,421 个元素   ← iHC / router / norm 等小张量
 ```
 
-所以 checkpoint 不是纯 BF16 的 1.56TB，而是 `2×779.93B + 4×30.8M ≈ 1.560TB`。
+所以 checkpoint 不是纯 BF16 的 1.55TB，而是
+`2×774.403B + 4×30.8M ≈ 1.549TB`。
 `lm_head` 在 HF 里是 fp32 模块，但 checkpoint 存 BF16；vLLM 也保持权重 dtype，
 只用 fp32 累加。账本按 BF16 算字节。
 
@@ -662,9 +713,9 @@ F32        30,795,421 个元素   ← iHC / router / norm 等小张量
 | 项 | 可行性 | 说明 |
 | --- | --- | --- |
 | L1 读图 / 默画 shape | ✅ | 本文 + `config.json` |
-| L2 真机 shape trace | ❌ | 权重 1.56TB，本机 16GB；transformers 4.57 也没有 `hy_v4` |
+| L2 真机 shape trace | ❌ | 权重 1.55TB，本机 16GB；transformers 4.57 也没有 `hy_v4` |
 | L3a 理论账本 | ✅ | `calc.py`，不需要权重 |
-| L3b profiler | ❌ | 没有能装下 770B 的 GPU |
+| L3b profiler | ❌ | 没有能装下 774B 的 GPU |
 
 L2 不是“不想做”，是物理上装不下。等有 8×B300 或 16×B200 级别的机器，再谈 L3b；
 L1 和 L3a 现在就能做完，而且换机器不用改。
@@ -677,13 +728,16 @@ L1 和 L3a 现在就能做完，而且换机器不用改。
 | `transformers/models/hy_v4/modeling_hy_v4.py` | `HYV4Attention`、`HYV4Indexer`、`HYV4MoE`、`HYV4HyperConnection` |
 | `vllm/models/hy_v4/nvidia/attention.py` | FlashMLA sparse、sink、DSA 的 kernel 侧实现 |
 | `vllm/models/hy_v4/nvidia/hc.py` | iHC 的 pre/post/head 三步 |
-| `vllm/models/hy_v4/nvidia/mtp.py` | MTP 层、`enorm/hnorm/eh_proj`、共享 head |
+| `vllm/models/hy_v4/nvidia/vl_model.py` | `HYV4VLForConditionalGeneration`：ViT + 文本主干 |
+| `vllm/models/hy_v4/nvidia/dfly.py` | DFly2 草稿模型、KV Share / Index Share |
+| `vllm/models/hy_v4/nvidia/vision.py` | ViT tower + patch merger |
 | `sglang/srt/models/hunyuan_v4.py` | 与 vLLM 交叉验证的另一种写法 |
 
 链接：
 
-- HF 模型卡：<https://huggingface.co/tencent/Hy4-preview>
-- HF config：<https://huggingface.co/tencent/Hy4-preview/raw/main/config.json>
+- HF 模型卡：<https://huggingface.co/tencent/Hy4>
+- HF config：<https://huggingface.co/tencent/Hy4/raw/main/config.json>
+- 官方仓库：<https://github.com/Tencent-Hunyuan/Hy4>
 - transformers：<https://github.com/huggingface/transformers/tree/main/src/transformers/models/hy_v4>
 - vLLM：<https://github.com/vllm-project/vllm/tree/main/vllm/models/hy_v4>
 - SGLang：<https://github.com/sgl-project/sglang/blob/main/python/sglang/srt/models/hunyuan_v4.py>

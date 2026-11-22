@@ -1,39 +1,37 @@
-# HY3
+# HY3 架构
 
-腾讯混元 **Hy3**（2026-07 正式版）的 shape、参数、FLOPs、访存账本。
-
-**不下载权重。** 所有数字只由本目录的 [`config.json`](config.json) 推出，
-计算脚本是 [`accounting.py`](accounting.py)，原始输出在 [`runs/accounting.log`](runs/accounting.log)。
+腾讯混元 **Hy3** 的 shape、参数、FLOPs、访存账本。**不下载权重**：所有数字只由本目录的
+[`config.json`](config.json) 推出，脚本是 [`accounting.py`](accounting.py)，原始输出在
+[`runs/accounting.log`](runs/accounting.log)。
 
 > 口径：参数量 / FLOPs 用十进制（`1B = 10^9`，`1T = 10^12`）；字节同时给 GB（`10^9`）和 GiB（`2^30`）。
 > 权重按 `bfloat16`（2 B/元素）算。attention 的 `T×T` 项按完整矩阵乘算，是上界；
 > causal 实际约一半，文中单独注明。
 
----
+## 1. 任务
 
-## 0. 先给结论
+Hy3 是腾讯混元 2026-07 开源的 **decoder-only 混合专家（MoE）语言模型**，做自回归文本生成：
+给一段 token，预测下一个 token，接回去继续生成。官方叫「快慢思考融合」，但那是后训练 / 推理模式，
+不是两套结构；80 层主干还是同一套 decoder block。
 
-| 项 | 值 | 来源 |
-| --- | --- | --- |
-| 总参数（主干，不含 MTP） | **295,033,528,320（295.03B）** | 逐模块求和，和官方「295B」对上 |
-| MTP 层参数 | **3,752,612,096（3.75B）** | 官方写 3.8B |
-| checkpoint 参数（含 MTP） | **298,786,140,416（298.79B）** | 和 HF safetensors 的 BF16 计数**逐位相等** |
-| 激活参数 / token | **20,675,715,072（20.68B）** | 官方写 21B |
-| 总参数 : 激活参数 | **14.27 : 1** | 192 个专家只开 8 个 + 1 个 shared |
-| 权重（BF16，主干） | **590.07 GB / 549.54 GiB** | 295.03B × 2 B |
-| 权重（BF16，含 MTP） | **597.57 GB / 556.53 GiB** | 298.79B × 2 B |
-| decode 每 token 读权重 | **40.36 GB** | 只读 top-8 专家，不读全部 192 个 |
-| KV cache / token | **320 KiB**（每层 4 KiB） | 80 层 × 2 × 8 KV heads × 128 |
-| 256K 上下文 KV | **80 GiB** | 262,144 × 320 KiB |
-| decode 算术强度（C=0） | **1.00 FLOP/B** | 40.38G FLOPs ÷ 40.38GB |
-| 8×H20-3e 显存 | 768 GB，权重占 597.57 GB | 剩 170.4 GB 给 KV / 激活 |
+官方模型卡给的关键规格：
 
-一句话：**这是一个 295B 总参数、20.7B 激活、80 层、每层 192 选 8 的 MoE；
-decode 每 token 只搬约 40 GB 权重，算术强度约 1，天然带宽瓶颈。**
+| 属性 | 值 |
+| --- | --- |
+| 架构 | decoder-only MoE |
+| 总参数 / 激活参数 | 295B / 21B |
+| MTP 层 | 1 层，3.8B |
+| 层数（不含 MTP） | 80 |
+| attention | 64 Q heads / 8 KV heads，head_dim 128（GQA） |
+| hidden / dense FFN | 4096 / 13312 |
+| experts | 192 选 8 + 1 shared，expert FFN 1536 |
+| 上下文 / 词表 | 256K / 120832 |
+| 精度 / 许可证 | BF16 / Apache-2.0 |
 
----
+本文只做两件事：把 80 层 block 的 shape 走通；用 `config.json` 算参数、FLOPs、访存。
+权重没下载；`config.json` 是唯一真源，改字段账本会跟着变。
 
-## 1. 代码从哪来
+### 1.1 代码从哪来
 
 Hy3 的模型代码不在权重仓库里，已经进了 HuggingFace Transformers 上游：
 
@@ -65,7 +63,9 @@ HYV3ForCausalLM   ← LlamaForCausalLM
 
 ---
 
-## 2. config 一张表
+## 2. 记号
+
+模型结构全在 `config.json` 里，直接用字段名，不再另起一套符号；只有 `T`、`C`、`batch_size` 是运行时才有的。
 
 `config.json` 取自 [`tencent/Hy3`](https://huggingface.co/tencent/Hy3/raw/main/config.json)，47 行，原样放在本目录。
 权重/模型卡是 Apache-2.0；Transformers 的 `hy_v3` 代码也是 Apache-2.0。
@@ -113,7 +113,9 @@ group   = 64 / 8   = 8           # 每个 KV 头服务 8 个 Q 头
 
 ---
 
-## 3. 和 Transformer / GPT 差在哪
+## 3. 结构
+
+### 3.1 和 Transformer / GPT 差在哪
 
 | 零件 | Transformer 2017 | GPT-2 | **HY3** |
 | --- | --- | --- | --- |
@@ -130,7 +132,7 @@ group   = 64 / 8   = 8           # 每个 KV 头服务 8 个 Q 头
 
 ---
 
-## 4. 全貌
+### 3.2 全貌
 
 ```mermaid
 flowchart TD
@@ -157,11 +159,11 @@ flowchart TD
 
 ---
 
-## 5. 一个 block 的 shape
+### 3.3 一个 block 的 shape
 
 记 `T` 为序列长度，`B` 为 batch。下面默认 `B = 1`。
 
-### 5.1 prefill（一次喂 T 个 token）
+#### 3.3.1 prefill（一次喂 T 个 token）
 
 | 操作 | shape | 说明 |
 | --- | --- | --- |
@@ -194,7 +196,7 @@ flowchart TD
 —— 一层就这么多。所以真实的 attention 不会把 `scores` 写出来，用 FlashAttention
 分块算；这里列形状是为了理解，不是为了真分配。
 
-### 5.2 decode（每次 1 个 token，带 KV cache）
+#### 3.3.2 decode（每次 1 个 token，带 KV cache）
 
 | 操作 | shape | 说明 |
 | --- | --- | --- |
@@ -219,7 +221,7 @@ decode 和 prefill 的差别只有三处：
 **这就是为什么推理要分两阶段**：prefill 的矩阵乘很大、能跑满算力；
 decode 的矩阵乘退化成矩阵-向量，瓶颈从算力换成带宽。
 
-### 5.3 GQA：64 个 Q 头，8 个 KV 头
+#### 3.3.3 GQA：64 个 Q 头，8 个 KV 头
 
 ```
 Q: 64 头 × 128 维 = 8192
@@ -240,7 +242,7 @@ GQA 省的不是 `scores` 的 FLOPs（还是 64 头），省的是：
 每层每 token；HY3 是 `2 × 8 × 128 × 2 B = 4 KiB`。80 层差 8 倍：
 **2.5 MiB vs 320 KiB per token**。
 
-### 5.4 QK-Norm + RoPE
+#### 3.3.4 QK-Norm + RoPE
 
 Q/K 投影之后、RoPE 之前，每个头在 128 维上做一次 RMSNorm：
 
@@ -263,7 +265,7 @@ q'_{2i+1} = q_{2i} sinθ + q_{2i+1} cosθ
 
 V 不做 RoPE。位置信息只通过 Q/K 的点积进入 attention。
 
-### 5.5 RMSNorm + 残差
+#### 3.3.5 RMSNorm + 残差
 
 每个 decoder 层两个 RMSNorm，最后再一个 final norm：
 
@@ -286,9 +288,9 @@ x = residual + x
 
 ---
 
-## 6. MoE
+### 3.4 MoE
 
-### 6.1 router：sigmoid + bias + 归一化 + 2.826
+#### 3.4.1 router：sigmoid + bias + 归一化 + 2.826
 
 每个 token 的 4096 维向量，过一个小矩阵 `W_r`（192×4096，**fp32**）：
 
@@ -310,7 +312,7 @@ w      = w * 2.826                 # router_scaling_factor
 - `e_score_correction_bias` 是 **buffer**，不是参数，也不进梯度；
   HF 的 forward 里 `aux_loss=None`，负载均衡靠训练侧更新这个 bias。
 
-### 6.2 专家：192 个，每个 1536 宽
+#### 3.4.2 专家：192 个，每个 1536 宽
 
 每个专家是一个 SwiGLU：
 
@@ -331,7 +333,7 @@ out[token] += y_e * w          # 按路由权重加权
 `n_e` 是分到专家 `e` 的 token 数。理想均匀时 `n_e = T × 8 / 192 = T/24`；
 `T = 4096` 时约 171 个 token/专家。
 
-### 6.3 shared expert：永远算的那一个
+#### 3.4.3 shared expert：永远算的那一个
 
 除了 192 个路由专家，每层还有 **1 个 shared expert**：
 
@@ -343,7 +345,7 @@ y_s = down(silu(gate(x)) * up(x))    # (T, 4096)
 - 所有 token 都过它，不参与路由；
 - 作用：给 routed experts 一个稳定的“公共底座”，减少路由波动。
 
-### 6.4 一层 MoE 的账
+#### 3.4.4 一层 MoE 的账
 
 | 部分 | 参数量 | 每 token 激活 |
 | --- | --- | --- |
@@ -360,7 +362,7 @@ y_s = down(silu(gate(x)) * up(x))    # (T, 4096)
 
 ---
 
-## 7. MTP：第 81 层
+### 3.5 MTP：第 81 层
 
 config 里 `num_nextn_predict_layers = 1`。checkpoint 里它是 `model.layers.80`，
 HF 的 `HYV3ForCausalLM` 不加载（`_keys_to_ignore_on_load_unexpected = [r"model\.layers\.80.*"]`），
@@ -396,9 +398,9 @@ token emb          (1, 1, 4096) ── enorm ─┐
 
 ---
 
-## 8. 参数量
+## 4. 参数
 
-### 8.1 公式
+### 4.1 公式
 
 记：
 
@@ -455,7 +457,7 @@ mtp = moe_layer + 2×H×H + 3×H
     = 3,752,612,096
 ```
 
-### 8.2 账本
+### 4.2 账本
 
 | 部分 | 公式 | 每层 / 每个 | 数量 | 合计 |
 | --- | --- | --- | --- | --- |
@@ -472,7 +474,7 @@ mtp = moe_layer + 2×H×H + 3×H
 | MTP | 1 层 MoE + eh_proj + 3 norm | — | 1 | 3,752,612,096 |
 | **checkpoint 合计** | | | | **298,786,140,416** |
 
-### 8.3 两种算法对账
+### 4.3 两种算法对账
 
 这是全文最重要的一次校验：
 
@@ -492,7 +494,7 @@ mtp = moe_layer + 2×H×H + 3×H
 HF 元数据里还有 15,360 个 F32 张量：`192 × 80 = 15,360`，正是每层 192 个
 `e_score_correction_bias`（buffer，不算参数）。
 
-### 8.4 激活参数
+### 4.4 激活参数
 
 | 部分 | 参数量 | 占比 |
 | --- | --- | --- |
@@ -514,11 +516,11 @@ HF 元数据里还有 15,360 个 F32 张量：`192 × 80 = 15,360`，正是每�
 
 ---
 
-## 9. FLOPs
+## 5. 计算量（FLOPs）
 
-### 9.1 规则
+### 5.1 规则
+
 > 单位：`G = 10⁹`、`T = 10¹²`（和厂商标的 TFLOPs 一致）。手算时凑 1024 记 K 只是为了快，不影响这里的读法。
-
 
 ```
 矩阵乘 (m,k) @ (k,n) → 2mkn FLOPs        # 乘加算两次
@@ -540,9 +542,9 @@ m = 4096（token）, k = 4096, n = 8192
 × 2 = 274.9G FLOPs
 ```
 
-四个投影（q/k/v/o）加起来约 `618G`，和 §9.2 的 `618.475G` 对得上。
+四个投影（q/k/v/o）加起来约 `618G`，和 §5.2 的 `618.475G` 对得上。
 
-### 9.2 prefill：`T = 4096`
+### 5.2 prefill：`T = 4096`
 
 | 部分 | 每层 | × 层数 | 合计 |
 | --- | --- | --- | --- |
@@ -571,7 +573,7 @@ MoE 层拆开（`T = 4096`）：
 - **router 很便宜**（0.25%），贵的是被选中的专家；
 - 序列短时 `T×T` 项小；`T = 4096` 时它已经占 attention 的 47%。
 
-### 9.3 decode：1 token，上下文 `C = 131072`
+### 5.3 decode：1 token，上下文 `C = 131072`
 
 | 部分 | 每层 | × 层数 | 合计 |
 | --- | --- | --- | --- |
@@ -599,10 +601,10 @@ MoE 层拆开：
 - `C = 262144` 时，涨到 **734.281 G**，attention C 项占 **93.6%**。
 
 所以长上下文 decode 的 FLOPs 看起来是 attention 主导，但它仍然是**带宽瓶颈**
-（见 10.4）：读 KV 的字节涨得一样快，算术强度只有 4.65（128K）/ 5.81（256K），
+（见 6.4）：读 KV 的字节涨得一样快，算术强度只有 4.65（128K）/ 5.81（256K），
 远低于 H20 的 37。
 
-### 9.4 校验：`2 × 激活参数`
+### 5.4 校验：`2 × 激活参数`
 
 | 口径 | decode `C=0` | prefill `T=4096` |
 | --- | --- | --- |
@@ -616,7 +618,7 @@ prefill 的差是 **attention 的 `T×T` 项 + softmax**：`T = 4096` 时约 44.
 
 > 短序列用「2 × 激活参数」估 FLOPs 很准；长序列必须单独加 `T×T`。
 
-### 9.5 如果它是 dense 模型
+### 5.5 如果它是 dense 模型
 
 ```
 dense 每 token = 2 × 295.03B = 590.07 G FLOPs
@@ -636,9 +638,9 @@ MoE 省的是**权重读取和专家计算**，不省 attention。上下文越�
 
 ---
 
-## 10. 访存
+## 6. 访存
 
-### 10.1 权重
+### 6.1 权重
 
 | 场景 | 读什么 | 字节 |
 | --- | --- | --- |
@@ -667,7 +669,7 @@ lm_head（494.93M × 2B）                0.990 GB
 > router 的 `gate.weight` 在 HF 里是 `_keep_in_fp32_modules_strict`。如果运行时真的按 fp32 存，
 > 79 层多 `79 × 786,432 × 2 B ≈ 124 MB`（0.3%），上面的账忽略了这个零头。
 
-### 10.2 KV cache
+### 6.2 KV cache
 
 每个 token、每层、每个 KV 头存 K 和 V 各 128 维：
 
@@ -692,7 +694,7 @@ lm_head（494.93M × 2B）                0.990 GB
 - TP=8 时每个 GPU 只存 1 个 KV 头，KV 也除以 8：
   256K 单序列每 GPU 10 GiB。
 
-### 10.3 激活
+### 6.3 激活
 
 decode 一个 token 的激活读写粗估 **19.3 MB**，相对 40.36 GB 权重是 0.05%，可以忽略。
 
@@ -709,7 +711,7 @@ prefill 的激活粗估：
 QKV、MLP、FlashAttention，实际远低于此。它的用途是给一个**上界**：
 即使按这个上界，prefill 在 `T ≥ 1024` 时仍然是算力瓶颈，结论不变。
 
-### 10.4 算术强度与 roofline
+### 6.4 算术强度与 roofline
 
 以 **8×H20-3e** 为例（BF16 148 TFLOPS/卡，4.0 TB/s/卡）：
 
@@ -762,9 +764,9 @@ batch 越大，每 token 摊到的权重流量越小；KV 读取则随 batch 线
 
 ---
 
-## 11. 部署含义
+## 7. 部署含义
 
-### 11.1 显存
+### 7.1 显存
 
 ```
 主干权重          590.07 GB
@@ -796,7 +798,7 @@ H100 80GB 的账：
 所以官方推荐 H20-3e（96 GB）而不是 H100 80GB。8×H100 80GB 在 TP=8 下
 最多跑约 64K 上下文，且只剩 2.6 GB 余量；想上 256K，需要 H20/H200 或更多卡。
 
-### 11.2 8×H20-3e 的粗估
+### 7.2 8×H20-3e 的粗估
 
 | 场景 | 估算 | 说明 |
 | --- | --- | --- |
@@ -809,7 +811,7 @@ H100 80GB 的账：
 这些是**上限/量级**，不是 vLLM/SGLang 的实测。真实数字会被 TP 通信、
 MoE all-to-all、路由不均衡、采样、调度拉低。L3b 要上真机才能填。
 
-### 11.3 这台机器
+### 7.3 这台机器
 
 ```
 Apple M4 / 16 GB / arm64 / 无 CUDA / MPS
@@ -827,11 +829,11 @@ Apple M4 / 16 GB / arm64 / 无 CUDA / MPS
 
 - **L1**：架构图 + shape（本文）；
 - **L3a**：纸面参数 / FLOPs / 访存（本文 + `accounting.py`）；
-- 用 tiny config 跑一遍同构代码，验证 shape 和公式（可选，见 13）。
+- 用 tiny config 跑一遍同构代码，验证 shape 和公式（见「附：下一步」）。
 
 ---
 
-## 12. 易错点
+## 8. 易错点
 
 1. **80 层不是 81 层。** 主干 80 层；checkpoint 里多出的 `layers.80` 是 MTP。
 2. **295B 不是 checkpoint 大小。** 295B 是主干；含 MTP 是 298.79B，和 safetensors 对上。
@@ -854,17 +856,25 @@ Apple M4 / 16 GB / arm64 / 无 CUDA / MPS
 
 ---
 
-## 13. 下一步
+## 9. 一句话总结
 
-- [x] `config.json` + 代码来源
-- [x] 参数量账本（和 298.79B 逐位对上）
-- [x] FLOPs / 访存 / KV cache
-- [x] 架构与 shape 文档
-- [ ] tiny config 跑通同构代码：`H=64, L=3, E=8, top_k=2, I=128, Im=64`，
-      验证 shape 和公式（本机可跑）
-- [ ] L3b：8×H20-3e 上跑 vLLM/SGLang，填实测列
-- [ ] 和 HY3-FP8 的权重/访存对比（FP8 约 299 GB）
-- [ ] HY4 / HY4-Flash
+| 项 | 值 | 来源 |
+| --- | --- | --- |
+| 总参数（主干，不含 MTP） | **295,033,528,320（295.03B）** | 逐模块求和，和官方「295B」对上 |
+| MTP 层参数 | **3,752,612,096（3.75B）** | 官方写 3.8B |
+| checkpoint 参数（含 MTP） | **298,786,140,416（298.79B）** | 和 HF safetensors 的 BF16 计数**逐位相等** |
+| 激活参数 / token | **20,675,715,072（20.68B）** | 官方写 21B |
+| 总参数 : 激活参数 | **14.27 : 1** | 192 个专家只开 8 个 + 1 个 shared |
+| 权重（BF16，主干） | **590.07 GB / 549.54 GiB** | 295.03B × 2 B |
+| 权重（BF16，含 MTP） | **597.57 GB / 556.53 GiB** | 298.79B × 2 B |
+| decode 每 token 读权重 | **40.36 GB** | 只读 top-8 专家，不读全部 192 个 |
+| KV cache / token | **320 KiB**（每层 4 KiB） | 80 层 × 2 × 8 KV heads × 128 |
+| 256K 上下文 KV | **80 GiB** | 262,144 × 320 KiB |
+| decode 算术强度（C=0） | **1.00 FLOP/B** | 40.38G FLOPs ÷ 40.38GB |
+| 8×H20-3e 显存 | 768 GB，权重占 597.57 GB | 剩 170.4 GB 给 KV / 激活 |
+
+> **这是一个 295B 总参数、20.7B 激活、80 层、每层 192 选 8 的 MoE；
+decode 每 token 只搬约 40 GB 权重，算术强度约 1，天然带宽瓶颈。**
 
 ---
 
@@ -883,3 +893,17 @@ llm/hy3/runs/accounting.log
 
 `accounting.py` 只读 `config.json`，不 import torch，不联网，不加载权重。
 改 config 里的任何字段，账本会跟着变；这是它作为「唯一真源」的用法。
+
+---
+
+## 附：下一步
+
+- [x] `config.json` + 代码来源
+- [x] 参数量账本（和 298.79B 逐位对上）
+- [x] FLOPs / 访存 / KV cache
+- [x] 架构与 shape 文档
+- [ ] tiny config 跑通同构代码：`H=64, L=3, E=8, top_k=2, I=128, Im=64`，
+      验证 shape 和公式（本机可跑）
+- [ ] L3b：8×H20-3e 上跑 vLLM/SGLang，填实测列
+- [ ] 和 HY3-FP8 的权重/访存对比（FP8 约 299 GB）
+- [ ] HY4 / HY4-Flash
