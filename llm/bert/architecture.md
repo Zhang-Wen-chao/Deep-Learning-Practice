@@ -16,19 +16,32 @@ BERT 做的是**完形填空**（Masked Language Modeling）：盖住句子里�
 
 ## 2. 记号
 
-| 名字 | bert-base-uncased | 是什么 |
-| --- | --- | --- |
-| `batch_size` | 1 | 几条句子 |
-| `seq_len` | 9 | 一条句子的 token 数（含 `[CLS]`、`[SEP]`） |
-| `dim_model` | 768 | 主干宽度 |
-| `num_heads` | 12 | 头数 |
-| `dim_k` | 64 | 每头维度 = 768 / 12 |
-| `dim_ff` | 3072 | FFN 中间宽度 |
-| `vocab_size` | 30522 | 词表大小 |
-| `num_layers` | 12 | encoder 层数 |
-| `max_pos` | 512 | 最长支持 512 个 token |
+模型结构全在 `config.json` 里，直接用它的字段名，不再另起一套符号。
+只有 `batch_size` 和 `seq_len` 是运行时才有的。
 
-`config.json` 里叫 `hidden_size` / `num_attention_heads` / `intermediate_size` / `num_hidden_layers`。
+| `config.json` 字段 | 值 | 是什么 |
+| --- | --- | --- |
+| `hidden_size` | 768 | 主干宽度 |
+| `num_attention_heads` | 12 | 头数 |
+| `num_hidden_layers` | 12 | encoder 层数 |
+| `intermediate_size` | 3072 | FFN 中间宽度 |
+| `vocab_size` | 30522 | 词表大小 |
+| `max_position_embeddings` | 512 | 最长位置数 |
+| `type_vocab_size` | 2 | `seg_emb` 的大小（句子 A/B） |
+| `hidden_act` | `gelu` | FFN 和 MLM 头的激活函数 |
+| `layer_norm_eps` | **1e-12** | LayerNorm 的 eps。PyTorch 默认 `1e-5`，用错 logits 差 0.01 量级 |
+| `hidden_dropout_prob` | 0.1 | 残差后的 dropout（推理时关掉） |
+| `attention_probs_dropout_prob` | 0.1 | attention 权重上的 dropout |
+| `position_embedding_type` | `absolute` | 绝对位置，可学习 |
+| `pad_token_id` | 0 | padding 的 id |
+
+两个运行时符号和一个算出来的：
+
+| 符号 | 值 | 来源 |
+| --- | --- | --- |
+| `batch_size` | 1 | 运行时 |
+| `seq_len` | 9 | 运行时（含 `[CLS]` / `[SEP]`） |
+| `head_dim` | 64 | `hidden_size / num_attention_heads`，config 里没有这个字段 |
 
 ## 3. 结构
 
@@ -52,17 +65,17 @@ BERT 做的是**完形填空**（Masked Language Modeling）：盖住句子里�
 
 ```mermaid
 flowchart TD
-    ID(["ids<br/>(batch_size, seq_len)"]) --> W["word_emb<br/>(batch_size, seq_len, dim_model)"]
-    TT(["token_type_ids"]) --> S["seg_emb<br/>(batch_size, seq_len, dim_model)"]
-    P["pos_emb<br/>(seq_len, dim_model)"] --> ADD
+    ID(["ids<br/>(batch_size, seq_len)"]) --> W["word_emb<br/>(batch_size, seq_len, hidden_size)"]
+    TT(["token_type_ids"]) --> S["seg_emb<br/>(batch_size, seq_len, hidden_size)"]
+    P["pos_emb<br/>(seq_len, hidden_size)"] --> ADD
     W --> ADD(("+"))
     S --> ADD
     ADD --> LN["LayerNorm"]
     LN --> BLK["Encoder Layer × 12<br/>self-attn（双向）→ +LN → FFN → +LN"]
-    BLK --> H["每个位置<br/>(batch_size, seq_len, dim_model)"]
+    BLK --> H["每个位置<br/>(batch_size, seq_len, hidden_size)"]
     H --> MLM["MLM 头<br/>(batch_size, seq_len, vocab_size)"]
-    H --> C["取第 0 个位置<br/>[CLS] (batch_size, dim_model)"]
-    C --> POOL["pooler + tanh<br/>(batch_size, dim_model)"]
+    H --> C["取第 0 个位置<br/>[CLS] (batch_size, hidden_size)"]
+    C --> POOL["pooler + tanh<br/>(batch_size, hidden_size)"]
 ```
 
 ### 3.3 shape 流水（真实跑出来的）
@@ -96,10 +109,10 @@ pos_emb       它在第几位（可学习）
 seg_emb       它属于第几句（A 还是 B）
 ```
 
-三者都是 `(batch_size, seq_len, dim_model)`，逐元素相加，宽度不变。
+三者都是 `(batch_size, seq_len, hidden_size)`，逐元素相加，宽度不变。
 `seg_emb` 只对"输入两句话"的任务（如 NSP、问答）有意义，单句时全是 0。
 
-### 3.5 MLM 头
+### 3.5 MLM 头（Masked Language Modeling，掩码语言建模）
 
 ```
 每个位置 (1, 9, 768)
@@ -113,57 +126,181 @@ seg_emb       它属于第几句（A 还是 B）
 
 ### 一层
 
-| 部分 | 形状 | 参数量 |
-| --- | --- | --- |
-| `q/k/v/out` 四个投影 | 4 × (768×768 + 768) | 2,363,904 |
-| `intermediate` | 3072×768 + 3072 | 2,362,368 |
-| `output.dense` | 768×3072 + 768 | 2,360,064 |
-| `LayerNorm` ×2 | γ、β 各 768 | 3,072 |
-| **一层合计** | | **7,087,872** |
+先把两个乘法约出来：
 
-`768² = 589,824`，`768×3072 = 2,359,296`——和 Transformer 一样，FFN 是注意力的两倍。
+```
+768 × 768 = (3 × 256) × (3 × 256)
+          = 9 × 256 × 256
+          = 9 × 64 × (4 × 256)      ← 4 × 256 = 1024 = 1K
+          = 576 × 1K
+          = 576K
+
+768 × 3072 = (3 × 256) × (3 × 1024)
+           = 9 × 256 × 1024
+           = 9 × 256 × 1K
+           = 2,304 × 1K
+           = 2,304K ≈ 2.3M
+```
+
+| 部分 | 完整式子 | 参数量 |
+| --- | --- | --- |
+| `q/k/v/out` 四个投影 | 4 × (768×768 + 768) = 4 × (576K + 768) = 2,304K + 3K | ≈2.3M |
+| `intermediate` | 768×3072 + 3072 = 2,304K + 3K | ≈2.3M |
+| `output.dense` | 3072×768 + 768 = 2,304K + 768 | ≈2.3M |
+| `LayerNorm` ×2 | 2 × (768 + 768) = 2 × 1.5K | 3K |
+| **一层合计** | 2.3M × 3 | **≈6.9M** |
+
+三个 `2,304K` 不是巧合：`3072 = 4 × 768`，所以 `768×3072 = 4 × 768² = 4 × 576K`。
+**FFN 占 4.6M，注意力占 2.3M**，FFN 是两倍，和 Transformer 一样。
 
 ### 整个模型
 
-| 部分 | 参数量 |
-| --- | --- |
-| embedding（word 23.4M + pos 0.4M + seg + LN） | 23,837,184 |
-| 12 层 | 85,054,464 |
-| pooler | 590,592 |
-| MLM 头（transform + LN + bias） | 622,650 |
-| **合计** | **110,104,890** |
+| 部分 | 约算 | 参数量 |
+| --- | --- | --- |
+| embedding | word 30522×768 ≈ 22.4M + pos 512×768 = 384K + seg 1.5K + LN 1.5K | 22.7M |
+| 12 层 | 6.76M × 12 | 81.1M |
+| pooler | 768×768 + 768 = 576K | 0.56M |
+| MLM 头 | transform 576K + LN 1.5K + bias 30K | 0.59M |
+| **合计** | | **105.0M** |
 
-和 HuggingFace 的 `BertForMaskedLM`（109,514,298）差 590,592，**正好是 pooler**——
-HF 的 MLM 版本不带 pooler，我们的保留着（分类任务要用）。
+精确值是 110,104,890。和 HuggingFace 的 `BertForMaskedLM`（109,514,298）差 590,592，
+**正好是 pooler**——HF 的 MLM 版本不带 pooler，我们的保留着（分类任务要用）。
 
 ## 5. 计算量
 
-一条规则：`FLOPs = 2 × 参数量 × token 数`。
+### 规则
 
 ```
-12 层 encoder = 2 × 85,054,464 × 9 = 1,530,980,352 ≈ 1.43G
-MLM 头        = 2 × 768 × 30522 × 9 =   421,936,128 ≈ 0.39G
-                                    ─────────────
-                                      1.82G
+矩阵乘 (m, k) @ (k, n) → m × k × n 次乘加，× 2 = FLOPs
 ```
 
-**FFN 仍占 2/3**：`4.72M / 7.09M`。
+BERT 里每个 Linear 的 `m` 都是 `seq_len`，`k × n` 是权重个数。本例 `seq_len = 9`。
 
-注意 `seq_len = 9` 时，attention 的 `9×9` 项只有 `2 × 12 × 9 × 9 × 64 = 124K`，可以忽略；
-但 `seq_len = 512` 时它变成 `2 × 12 × 512 × 512 × 64 = 403M`，接近 FFN 的量级。
+### 一个 Linear 的算法，展开看
+
+以 `q_proj`（`768 → 768`）为例：
+
+```
+9 × 768 × 768
+= 9 × 576K             ← 768² = 576K
+= 5,184K
+= 5.18M 次乘加
+
+× 2 = 10.4M FLOPs      ← 乘加算两次
+```
+
+### encoder 一层
+
+| 操作 | 公式 | 代入 | FLOPs | 占比 |
+| --- | --- | --- | --- | --- |
+| `q_proj` | `2 × seq_len × 768 × 768` | `2 × 9 × 576K` | 10.4M | 8.3% |
+| `k_proj` | 同上 | | 10.4M | 8.3% |
+| `v_proj` | 同上 | | 10.4M | 8.3% |
+| `scores` | `2 × num_attention_heads × seq_len × seq_len × head_dim` | `2 × 12 × 9×9 × 64` | 124K | 0.1% |
+| `attn @ V` | 同上 | | 124K | 0.1% |
+| `out_proj` | `2 × seq_len × 768 × 768` | `2 × 9 × 576K` | 10.4M | 8.3% |
+| `intermediate` | `2 × seq_len × 768 × 3072` | `2 × 9 × 2,304K` | 41.5M | 33.3% |
+| `output.dense` | `2 × seq_len × 3072 × 768` | `2 × 9 × 2,304K` | 41.5M | 33.3% |
+| **合计** | | | **≈124M** | **100%** |
+
+三条能直接记住的：
+
+- **FFN 占 2/3**（`intermediate` + `output.dense` = 83M），注意力四个投影占 1/3
+- **`intermediate` 一个就等于 1/3**——`3072 = 4 × 768`，一次变宽顶四次投影
+- **`9×9` 那两项合计 0.2%**，`seq_len = 9` 时可以当 0
+
+### 12 层 + MLM 头
+
+```
+encoder 12 层 = 124M × 12          ≈ 1.5G
+MLM 头        = 2 × 9 × 768 × 30522 ≈ 0.42G
+                                   ─────────
+                             合计   ≈ 1.9G
+```
+
+MLM 头展开：`9 × 768 × 30522 = 9 × 23.4M = 211M` 次乘加，`× 2 = 422M`。
+
+### 长上下文：注意力的平方项
+
+`seq_len = 9` 时 `scores` 和 `attn @ V` 只有 124K，可以忽略。但它是 `O(seq_len²)`：
+
+```
+2 × num_attention_heads × seq_len × seq_len × head_dim
+= 2 × 12 × 512 × 512 × 64
+= 402,653,184 ≈ 403M
+```
+
+`seq_len = 512` 时，单层这两项就有 403M，**超过整层 FFN 的 83M**。
+这是 BERT 最长 512 的代价：再长，注意力会彻底压过 FFN。
 
 ## 6. 访存
 
-BERT 只有**一次前向**，不像 GPT 要逐 token 生成：
+### 规则
 
 ```
-权重 110,104,890 × 4 字节（fp32）≈ 420M
+Bytes = (读入元素数 + 权重元素数 + 写出元素数) × 4 字节（fp32）
 ```
 
-跑一次就要把 420M 权重读一遍。所以 BERT 的算术强度是 `1.82G / 420M ≈ 4.3 flop/byte`，
-比 GPT 的 decode（0.61）高得多——**BERT 更容易跑满算力，GPT 的 decode 卡带宽**。
+BERT 只有**一次前向**，没有 prefill / decode 之分：输入进去，权重要读一遍。`seq_len = 9`。
 
-这也是为什么批量推理时 BERT 吞吐高：batch 越大，权重摊得越薄。
+### 一个投影怎么算
+
+以 `q_proj` 为例：
+
+```
+读入   9 × 768 = 6,912 ≈ 6.75K
+权重   768 × 768 = 576K
+写出   9 × 768 = 6,912 ≈ 6.75K
+       ─────────────────────
+合计   576K + 13.5K ≈ 589.5K
+× 4 字节 = 2,358K ≈ 2.3M
+```
+
+### ① self-attention
+
+| 操作 | 权重 | 读入+写出 | 字节 |
+| --- | --- | --- | --- |
+| `q/k/v/out` 四个投影 | 4 × 576K | 4 × 13.5K | 9,432K ≈ 9.2M |
+| `scores` | 0（无参数） | `(1,12,9,9)` 的读写 | 0.01M |
+| **小计** | | | **≈9.2M** |
+
+`scores` / `softmax` / `attn @ V` 没有权重，只有 `9×9` 的中间张量，可以忽略。
+
+### ② FFN
+
+| 操作 | 权重 | 读入+写出 | 字节 |
+| --- | --- | --- | --- |
+| `intermediate` | 2,304K | 27K + 6.75K | 9.1M |
+| `output.dense` | 2,304K | 6.75K + 27K | 9.1M |
+| **小计** | | | **≈18.2M** |
+
+### 一层合计
+
+```
+9.2（self） + 18.2（FFN） + 0.15（LayerNorm×2 + bias） ≈ 27.6M
+```
+
+### 12 层 + MLM 头
+
+| 部分 | 字节 | 占比 |
+| --- | --- | --- |
+| encoder 12 层 | 331M | 78% |
+| MLM 头 | 93M | 22% |
+| **合计** | **≈424M** | 100% |
+
+MLM 头里的 `to_vocab`：`30522 × 768 = 22.4M` 个权重，`× 4 = 90M`——
+**一个矩阵就顶 3 层 encoder**。
+
+### 代进公式
+
+| 项 | 值 |
+| --- | --- |
+| 访存 | 424M |
+| FLOPs | 1.9G |
+| 算术强度 | `1.9G / 424M ≈ 4.5 flop/byte` |
+
+算术强度 4.5 比 GPT 的 decode（0.61）高一个数量级——**BERT 没有逐 token 的重复读**，
+所以更容易跑满算力。batch 越大，权重摊得越薄，吞吐越高。
 
 ## 7. 位置编码：可学习的
 
@@ -172,7 +309,7 @@ BERT 用 `nn.Embedding(512, 768)`，不是 sin/cos：
 | | Transformer | BERT |
 | --- | --- | --- |
 | 怎么来 | 公式算，固定 | 训练学出来 |
-| 参数 | 0 | 512 × 768 = 393,216 |
+| 参数 | 0 | 512 × 768 = 384K |
 | 上限 | 由公式决定，理论可外推 | 硬上限 512 个位置 |
 
 代价是丢了外推能力：句子超过 512 个 token 直接截断。

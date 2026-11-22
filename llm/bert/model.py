@@ -34,6 +34,12 @@ def sp(t):
     return str(tuple(t.shape)).replace(" ", "")
 
 
+def lin_note(lhs, lhs_name, wname, lin):
+    wt = str(tuple(reversed(lin.weight.shape))).replace(" ", "")
+    bt = str(tuple(lin.bias.shape)).replace(" ", "")
+    return f"{lhs_name}{sp(lhs)} @ {wname}ᵀ{wt} + b{bt}"
+
+
 def trace(name, t, note=""):
     if TRACE:
         print(f"{'  ' * DEPTH}{name:<24}{sp(t):<26}{note}")
@@ -95,16 +101,25 @@ class BertSelfAttention(nn.Module):
 
     def forward(self, x):
         b, s, d = x.shape
-        q = self.q(x).view(b, s, self.heads, self.dim_k).transpose(1, 2)   # (b, heads, s, dim_k)
-        k = self.k(x).view(b, s, self.heads, self.dim_k).transpose(1, 2)
-        v = self.v(x).view(b, s, self.heads, self.dim_k).transpose(1, 2)
-        trace("q/k/v 拆头", q, f"({b},{self.heads},{s},{self.dim_k})")
+        q = self.q(x)                                       # (b, s, hidden_size)
+        k = self.k(x)
+        v = self.v(x)
+        trace("q_proj", q, lin_note(x, "x", "Wq", self.q))
+        trace("k_proj", k, lin_note(x, "x", "Wk", self.k))
+        trace("v_proj", v, lin_note(x, "x", "Wv", self.v))
+        q = q.view(b, s, self.heads, self.dim_k).transpose(1, 2)   # (b, heads, s, dim_k)
+        k = k.view(b, s, self.heads, self.dim_k).transpose(1, 2)
+        v = v.view(b, s, self.heads, self.dim_k).transpose(1, 2)
+        trace("拆头 q", q, f"{sp(x)} view({b},{s},{self.heads},{self.dim_k}).transpose(1,2)")
+        trace("拆头 k", k, f"{sp(x)} view({b},{s},{self.heads},{self.dim_k}).transpose(1,2)")
         scores = q @ k.transpose(-2, -1) / math.sqrt(self.dim_k)           # (b, heads, s, s)
-        trace("scores", scores, f"{s}×{s} 双向，不遮")
+        trace("scores", scores, f"q{sp(q)} @ kᵀ{sp(k.transpose(-2,-1))} / √{self.dim_k}")
         attn = scores.softmax(-1)                                          # (b, heads, s, s)
-        trace("softmax", attn)
-        out = (attn @ v).transpose(1, 2).contiguous().view(b, s, d)         # (b, s, dim_model)
-        trace("拼头", out, "输出投影在 BertAttention 里")
+        trace("softmax", attn, "dim=-1，每行和=1")
+        h = attn @ v                                                       # (b, heads, s, dim_k)
+        trace("attn @ V", h, f"attn{sp(attn)} @ v{sp(v)}")
+        out = h.transpose(1, 2).contiguous().view(b, s, d)                 # (b, s, hidden_size)
+        trace("拼头", out, f"({b},{s},{self.heads},{self.dim_k}) view({b},{s},{d})")
         return out
 
 
@@ -120,10 +135,10 @@ class BertAttention(nn.Module):
     def forward(self, x):
         residual = x                                       # (b, s, dim_model)
         h = self.attn(x)
-        h = self.out(h)                                    # (b, s, dim_model)
-        trace("out_dense", h)
+        h = self.out(h)                                    # (b, s, hidden_size)
+        trace("out_dense", h, lin_note(h, "x", "Wo", self.out))
         x = self.norm(residual + h)                        # (b, s, dim_model)
-        trace("+ 残差 + LN", x, "post-LN")
+        trace("+ 残差 + LN", x, f"残差{sp(residual)} + 注意力输出{sp(h)} → LN")
         return x
 
 
@@ -138,13 +153,14 @@ class BertLayer(nn.Module):
     def forward(self, x):
         x = self.attention(x)                              # (b, s, dim_model)
         residual = x
-        h = self.inter(x)                                  # (b, s, dim_ff)
-        trace("intermediate", h, "变宽 ×4")
-        h = F.gelu(h)                                      # (b, s, dim_ff)
-        h = self.out(h)                                    # (b, s, dim_model)
-        trace("output.dense", h, "变回")
-        x = self.norm(residual + h)                        # (b, s, dim_model)
-        trace("+ 残差 + LN", x)
+        h = self.inter(x)                                  # (b, s, intermediate_size)
+        trace("intermediate", h, lin_note(x, "x", "W1", self.inter))
+        h = F.gelu(h)                                      # (b, s, intermediate_size)
+        trace("gelu", h, "逐元素，形状不变")
+        h = self.out(h)                                    # (b, s, hidden_size)
+        trace("output.dense", h, lin_note(h, "h", "W2", self.out))
+        x = self.norm(residual + h)                        # (b, s, hidden_size)
+        trace("+ 残差 + LN", x, f"残差{sp(residual)} + FFN输出{sp(h)} → LN")
         return x
 
 
@@ -184,18 +200,20 @@ class BertForMaskedLM(nn.Module):
         self.bert = BertModel(vocab, dim, heads, dim_ff, layers)
         self.transform = nn.Linear(dim, dim)
         self.norm = nn.LayerNorm(dim, eps=1e-12)
-        self.decoder = nn.Linear(dim, vocab, bias=True)    # (vocab_size, dim_model)
-        self.decoder.weight = self.bert.emb.word.weight    # weight tying
+        self.to_vocab = nn.Linear(dim, vocab, bias=True)   # (vocab_size, hidden_size)
+        self.to_vocab.weight = self.bert.emb.word.weight   # weight tying
 
     def forward(self, ids, token_type_ids=None):
         seq, pooled = self.bert(ids, token_type_ids)
         with stage("MLM 头"):
-            h = F.gelu(self.transform(seq))                # (b, s, dim_model)
-            trace("transform + gelu", h)
-            h = self.norm(h)                               # (b, s, dim_model)
+            h = self.transform(seq)                        # (b, s, hidden_size)
+            trace("transform", h, lin_note(seq, "x", "W", self.transform))
+            h = F.gelu(h)                                  # (b, s, hidden_size)
+            trace("gelu", h, "逐元素")
+            h = self.norm(h)                               # (b, s, hidden_size)
             trace("LayerNorm", h)
-            logits = self.decoder(h)                       # (b, s, vocab_size)
-            trace("decoder", logits, "dim_model → vocab_size")
+            logits = self.to_vocab(h)                      # (b, s, vocab_size)
+            trace("to_vocab", logits, lin_note(h, "h", "W", self.to_vocab) + "  权重和 word_emb 共享")
         return logits, pooled
 
 
@@ -235,9 +253,9 @@ def load_pretrained(model, name="bert-base-uncased"):
         k2 = k2.replace("bert.pooler.dense", "bert.pooler")
         k2 = k2.replace("cls.predictions.transform.dense", "transform")
         k2 = k2.replace("cls.predictions.transform.LayerNorm", "norm")
-        k2 = k2.replace("cls.predictions.decoder", "decoder")
+        k2 = k2.replace("cls.predictions.decoder", "to_vocab")
         if k2.startswith("cls.predictions.bias"):
-            k2 = "decoder.bias"
+            k2 = "to_vocab.bias"
         new[k2] = v
     missing, unexpected = model.load_state_dict(new, strict=False)
     print(f"  加载 {len(new)} 个张量")
