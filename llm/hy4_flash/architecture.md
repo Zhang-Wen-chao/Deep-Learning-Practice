@@ -445,6 +445,8 @@ DFly2 的 846,190,697 不是从 config 算出来的（config 只给了
 ## 5. 计算量
 
 ### 5.1 线性层
+> 单位：`G = 10⁹`、`T = 10¹²`（和厂商标的 TFLOPs 一致）。手算时凑 1024 记 K 只是为了快，不影响这里的读法。
+
 
 一个 Linear `(m,k) @ (k,n)` 是 `m*k*n` 次乘加，算 2 FLOPs：
 
@@ -452,11 +454,22 @@ DFly2 的 846,190,697 不是从 config 算出来的（config 只给了
 FLOPs = 2 × token 数 × in × out
 ```
 
-每 token 的线性层总量就是 `2 × 激活参数`：
+手算一个算子（`lm_head`，每 token）：
+
+```
+m = 1, k = 3072, n = 120832
+1 × 3072 × 120832 = 371.2M 次乘加
+× 2 = 0.74G FLOPs
+```
+
+把所有 Linear 按 `m×k×n` 逐项累加，结果等于"激活参数 × 2"：
 
 ```
 2 × 11,270,639,693 = 22.541 G FLOPs/token
 ```
+
+这个等式成立，是因为每个激活权重对每个 token 只用一次。**别把它当定义**——
+推导仍然是 `m×k×n`。
 
 这已经包含 attention 的 q/kv/o/gate、indexer 的投影、MoE 的 top-16
 experts + shared + pre/post、router、lm_head、Engram 投影；不包含
@@ -528,9 +541,9 @@ kernel 会缓存 pooled keys，只更新最后一个未满的组；这部分在�
 1M 的 decode 拆开：
 
 ```
-线性层                 22.541 G
-attention core          1.812 G
-indexer 打分           12.986 G
+线性层                 22.541 G   (60.4%)
+attention core          1.812 G   ( 4.9%)
+indexer 打分           12.986 G   (34.8%)
                        ─────────
 理想合计               37.339 G FLOPs/token
 eager 池化            824.634 G
