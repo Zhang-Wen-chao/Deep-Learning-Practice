@@ -166,7 +166,7 @@ GPT-2 124M 的参数分三块：embedding、12 个 block、最后的 LN。`lm_he
 | `c_proj`（MLP） | 3072 × 768 + 768 | 2,360,064 |
 | **合计** | | **7,087,872** |
 
-> 之前 README 里写的 `124,402,944` 少了 `12 × 3,072 = 36,864`，正好是 12 层 `c_fc` 的 bias。以 `state_dict` 数出来的 **124,439,808** 为准。
+> 之前这里写的 `124,402,944` 少了 `12 × 3,072 = 36,864`，正好是 12 层 `c_fc` 的 bias。以 `state_dict` 数出来的 **124,439,808** 为准。
 
 > GPT-2 论文 Table 2 写的是 117M / 345M / 762M / 1542M；Hugging Face 的 `gpt2` 是 124.4M。词表和版本口径不同，不要直接对；以 `config.json` + 真实 `state_dict` 为准。
 
@@ -255,10 +255,41 @@ M4 CPU 的这个比值约 0.8，1.0 已经在临界附近；换到 GPU 会更明
 
 两句话结论：
 
-1. **前三篇在架构上没有增量。** 三篇读下来，shape 表一个字都不用改 ——
-   都是 decoder-only，只差层数和宽度。它们讲的是训练范式和能力，不是结构。
+1. **对 shape 主线没有新增算子。** GPT-1/2 是同一套 decoder block，只差 vocab、context 和规模；
+   GPT-3 的 alternating dense/sparse attention 改的是 mask pattern，主 shape 表仍是
+   `(batch_size, num_heads, T, T)`。三篇的增量在数据、训练和规模，不在新算子。
 2. **不是"后来不发论文了"，是不再公开技术细节。** GPT-4 起仍有 technical report，
    但里面没有参数量、没有数据规模、没有架构图，只剩评测和安全性说明。
+
+所以不需要 GPT-1/2/3 各写一遍：会 GPT-2，换 config 就覆盖 GPT-1/2 的各尺寸；
+GPT-3 没有开放权重，读论文即可。真正该动手的是下一档 HY3——RoPE、GQA、SwiGLU、
+RMSNorm、MoE 才是新零件。
+
+## 为什么不需要 GPT-1/2/3 各写一遍
+
+把三者的配置摆在一起：
+
+| | GPT-1 | GPT-2 small | GPT-3 |
+| --- | --- | --- | --- |
+| 参数 | 117M | 124M | 175B |
+| 层数 | 12 | 12 | 96 |
+| `dim_model` | 768 | 768 | 12288 |
+| `num_heads` | 12 | 12 | 96 |
+| `dim_ff` | 3072 | 3072 | 49152 |
+| 上下文 | 512 | 1024 | 2048 |
+| 词表 | 40478 | 50257 | 50257 |
+| 权重 | 有 | 有 | 无 |
+
+前三列的变化只是数字变大，算子没变：
+
+- **GPT-1**：和 GPT-2 small 同构，换 `vocab_size` / `max_pos` 就能用同一份代码；没有新 shape。
+- **GPT-2 medium/large/xl**：只改层数、宽度、头数；shape 表不变。
+- **GPT-3**：没有开放权重，跑不了；它的 alternating dense/sparse attention 改的是 mask pattern，
+  `scores` 的主 shape 仍是 `(batch_size, num_heads, T, T)`，稀疏层只是不把整张矩阵都算/存。
+  读论文看训练、数据和规模即可，不需要写 175B 模型。
+
+真正会改变 shape 和计算量的是下一档 HY3：RoPE、GQA、SwiGLU、RMSNorm、MoE。
+如果以后想做 GPT-3 的 sparse attention，单独做一节 mask pattern 实验就行，不用建 175B。
 
 ## 跑法
 

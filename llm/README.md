@@ -32,6 +32,38 @@
 还有第四条：**输出是标签，但标注数据很少** —— 用 decoder 做 few-shot 可能比训 encoder
 更省事，代价是延迟和成本。边界一直在移动，不是硬规则。
 
+## 心算约定
+
+不用计算器，看公式就能报出量级。三条：
+
+1. **乘的过程中，凑出 1000 或 1024 就立刻换成 `1K` 带走**，剩下的继续乘。
+
+   ```
+   768 × 3072 = (3×256) × (3×1024)
+              = 9 × 256 × 1K        ← 1024 变 1K，带走
+              = 2,304K
+   ```
+
+   `4 × 256`、`2 × 512`、`8 × 128` 都能凑 1024，随手用。
+
+2. **K 换 M 直接除 1000**，只为了读量级。
+
+   ```
+   2,304K ≈ 2.3M
+   ```
+
+   **不要在最后再除 1024**——那是画蛇添足。
+
+3. **FLOPs 按矩阵乘算**：
+
+   ```
+   (m, k) @ (k, n)  →  m × k × n 次乘加
+   × 2  →  FLOPs
+   ```
+
+   一层里的 Linear 全加起来，才等价于 `2 × 参数量 × token 数`。
+   后者只是合并后的简写，**看不懂就用 `2mnk`**，别拿简写当定义。
+
 ## 目录
 
 ```
@@ -43,13 +75,30 @@ llm/
 │   ├── data/pairs.tsv
 │   └── runs/model_py_flow.log
 ├── gpt/
-│   ├── README.md             # GPT-2 架构 + shape + 参数/FLOPs/KV cache
+│   ├── architecture.md       # GPT-2 架构 + shape + 参数/FLOPs/KV cache
 │   ├── model.py              # 自写 GPT-2，加载 HF 权重，prefill + decode
 │   └── runs/gpt2_shapes.log
-└── bert/
-    ├── architecture.md       # BERT 架构图 + shape + 参数/FLOPs/访存
-    ├── model.py              # 自写 encoder-only，加载 bert-base-uncased
-    └── runs/bert_flow.log
+├── bert/
+│   ├── architecture.md       # BERT 架构图 + shape + 参数/FLOPs/访存
+│   ├── model.py              # 自写 encoder-only，加载 bert-base-uncased
+│   └── runs/bert_flow.log
+├── hy3/
+│   ├── README.md             # HY3 架构 + shape + 参数/FLOPs/访存
+│   ├── config.json           # 官方 config（唯一真源）
+│   ├── accounting.py         # 只读 config 的纸面账本
+│   └── runs/accounting.log   # 原始输出
+├── hy4/
+│   ├── README.md             # HY4-preview 入口：结论 + 文件导航
+│   ├── architecture.md       # 结构、shape、参数、FLOPs、KV cache
+│   ├── calc.py               # 只读 config 的账本
+│   ├── configs/hy4-preview.json
+│   └── runs/calc.log
+└── hy4_flash/
+    ├── README.md             # HY4-Flash 结论 + config 速查 + 代码链接
+    ├── architecture.md       # MLA / DSA / SWA / LatentMoE / Engram / iHC 形状
+    ├── accounting.py         # 只读 config 的账本
+    ├── config.json           # 官方 config（唯一真源）
+    └── runs/                 # accounting.log + accounting_1m.log
 ```
 
 ## 三层目标
@@ -75,11 +124,15 @@ llm/
 | --- | --- | --- | --- | --- | --- | --- |
 | 0 | **Transformer 2017**（enc-dec） | 地基：MHA + FFN + 残差 + LN + 位置编码 | ✅ | ✅ | ✅ | [ ] |
 | 1 | **GPT-2 124M** | decoder-only；删掉 encoder 和 cross-attn；学习式位置编码；weight tying | ✅ | ✅ | ✅ | [ ] |
-| 2 | **HY3** | 待查 config | [ ] | [ ] | [ ] | [ ] |
-| 3 | **HY4 / HY4-Flash** | 待查 config | [ ] | [ ] | [ ] | [ ] |
+| 2 | **HY3**（295B MoE） | MoE 192选8 + shared；GQA 64/8；QK-Norm；SwiGLU；RoPE；MTP | ✅ | — | ✅ | [ ] |
+| 3 | **HY4**（770B MoE） | Gated MLA + DSA + iHC + 256选8 + MTP；MLA 把 KV 压到 93KiB/token | ✅ | — | ✅ | [ ] |
+| 4 | **HY4-Flash**（220B） | 12 层 DSA + 30 层 SWA；LatentMoE 512选16；Engram；ViT；DFly2 | ✅ | — | ✅ | [ ] |
 | — | **BERT-base**（旁支） | encoder-only；双向、无 causal mask；可学习位置；三种 embedding；MLM 头 | ✅ | ✅ | ✅ | [ ] |
 
 不做：Llama 权重、DeepSeek-V4.1-Flash。
+
+HY3 的 L2 标 `—`：权重 BF16 约 597.6 GB，这台 16 GB 的 M4 装不下，也没有 8 卡机器。
+能做的是 L1（架构 + shape）和 L3a（纸面账本）；MTP 的 3.8B 权重也包含在 checkpoint 里。
 
 为什么第 1 档是 GPT-2 124M：
 
@@ -98,8 +151,12 @@ GPT-1 和 GPT-2 是同一套 decoder block，不单独设档；GPT-2 的 medium/
    `hidden_size / num_attention_heads / num_key_value_heads / intermediate_size /
    num_experts / moe_top_k` 抄成一张表。第 2、3 档尤其如此 —— 名字对不上就先纠正。
 
-从 GPT-2 直接跳到 HY3，中间的零件（RoPE / GQA / SwiGLU / KV cache 之类）不单独设一档，
-等 HY3 的 config 到手，按真实字段逐个对。
+从 GPT-2 直接跳到 HY3 / HY4，中间的零件（RoPE / GQA / SwiGLU / KV cache / MLA /
+DSA / MoE / iHC 之类）不单独设一档，直接在真实 config 上逐个对：
+
+- `llm/hy3/`：295B MoE，GQA + QK-Norm + SwiGLU + RoPE + MTP；
+- `llm/hy4/`：770B MoE，Gated MLA + DSA + iHC；
+- `llm/hy4_flash/`：220B，混合 SWA/DSA + LatentMoE + Engram + ViT + DFly2。
 
 ## 已知数：GPT-2 124M
 
@@ -118,6 +175,49 @@ GPT-1 和 GPT-2 是同一套 decoder block，不单独设档；GPT-2 的 medium/
 decode 每生成一个 token 都要把 249 MB 权重读一遍 —— 这就是带宽瓶颈的来源，
 也是为什么 decode 要看字节而不是 FLOPs。
 
+## 已知数：HY3
+
+纯纸面算，权重没下载。账本在 `hy3/runs/accounting.log`，所有数字由 `hy3/accounting.py`
+只读 `hy3/config.json` 生成：
+
+| 项 | 值 |
+| --- | --- |
+| 参数（主干 / 含 MTP） | 295,033,528,320（295.03B）/ 298,786,140,416（298.79B） |
+| 激活参数 | 20,675,715,072（20.68B） |
+| prefill `T=4096` | 209.8T FLOPs（51.2G / token） |
+| decode `C=0` | 40.4G FLOPs / token |
+| decode `C=128K` | 387.3G FLOPs / token |
+| 权重（BF16） | 590.07 GB（含 MTP 597.57 GB） |
+| decode 权重 / token | 40.36 GB（只读 top-8 专家） |
+| KV cache | 320 KiB / token；256K 上下文 = 80 GiB |
+| decode 算术强度 | 1.00 FLOP/B（C=0）→ 带宽瓶颈 |
+
+含 MTP 的 298,786,140,416 和 HF safetensors 的 BF16 计数**逐位相等**，
+说明 config 没抄错、MTP 没重复算 embedding/lm_head。
+
+## 已知数：HY4 / HY4-Flash
+
+纯纸面算，权重没下载。HY4 的账本在 `hy4/runs/calc.log`，Flash 在
+`hy4_flash/runs/accounting.log`：
+
+| 项 | HY4（preview） | HY4-Flash |
+| --- | --- | --- |
+| checkpoint 参数 | 779.96B（769.91B + 10.05B MTP） | 220.25B（含 Engram 63.46B） |
+| 激活 / token | 49.06B | 11.27B（text） |
+| prefill | 107.45G FLOPs/token（S=2K） | 24.14G FLOPs/token（S=4K） |
+| decode | 107.45G FLOPs/token（C=2K） | 25.98G FLOPs/token（C=128K） |
+| decode 权重 / token | 89.99GiB（BF16） | 21.68GiB（含 fp32 lm_head） |
+| KV / token | 93.0KiB（全历史） | 50.25KiB（上界）/ 16.50KiB（HF 默认） |
+| 算术强度 | 1.11（C=2K） | 0.91–21.0（HF 默认；看上下文/是否含池化） |
+
+HY4 的 checkpoint `779,960,992,733` 和 HF safetensors **逐位相等**，MTP 10.054B
+是残差；Flash 的 `220,255,011,261`（DFly2=0.85B 口径）和 `220,251,201,958`
+差 0.0017%。
+
+Flash 的 L1 细节（42 层排布、MLA/DSA/SWA 的每一个 shape、Engram 的 16 张
+哈希表、iHC 的 4 条流）在 `hy4_flash/architecture.md`；L2 标 `—` 是因为
+BF16 440.5 GB、4-bit 仍约 110 GB，16 GB 的 M4 装不下。
+
 ## 这台机器
 
 ```
@@ -125,12 +225,17 @@ Apple M4 / 16 GB / arm64 / 无 CUDA / MPS 可用 / transformers 装在 ~/.venvs/
 ```
 
 L1 / L2 / L3a 都能做。L3b 等换机器：只需测本机的两个常数（可达算力、可达带宽），
-再跑一遍 profiler 填实测列。
+再跑一遍 profiler 填实测列。HY3 / HY4 / HY4-Flash 是例外：权重分别是 597.6 GB、
+1.56 TB、440 GB，本机 L2 都做不了，只做 L1 + L3a。
 
 ## 下一步
 
 - [x] `transformers` 装到 `~/.venvs/llm-gpt`
 - [x] GPT-2 `model.py` + `runs/gpt2_shapes.log`（prefill + decode 都有）
 - [x] GPT-2 的 L1：单栈、causal mask、KV cache、参数量/FLOPs/访存
-- [ ] HY3：拿到 config 后，按 `hidden_size / num_attention_heads / num_key_value_heads / intermediate_size / num_experts / moe_top_k` 逐项对
+- [x] HY3：config + 架构 + 参数/FLOPs/访存账本（`llm/hy3/`）
+- [x] HY4-preview：config + 架构 + 参数/FLOPs/访存账本（`llm/hy4/`）
+- [x] HY4-Flash：config + 架构 + 参数/FLOPs/访存账本（`llm/hy4_flash/`）
+- [ ] HY3 的 tiny config：`H=64, L=3, E=8, top_k=2` 跑同构代码，验证 shape
+- [x] HY4-Flash 的 L1 架构文档（`llm/hy4_flash/architecture.md`）
 - [ ] L3b：换机器后跑 profiler，把 `实测 t / 倍数` 填进账表

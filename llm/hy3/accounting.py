@@ -116,14 +116,14 @@ def param_ledger(d):
     lm_head = V * H
     final_norm = H
 
-    main = layer_dense + (d["L"] - d["first_dense"]) * layer_moe + embed + lm_head + final_norm
+    main = d["first_dense"] * layer_dense + (d["L"] - d["first_dense"]) * layer_moe + embed + lm_head + final_norm
 
     eh_proj = 2 * H * H
     mtp = layer_moe + eh_proj + 2 * H + H  # enorm + hnorm + shared_head.norm
     total = main + d["mtp"] * mtp
 
     active_layer_moe = attn + router + d["top_k"] * expert + shared + norms
-    active_main = layer_dense + (d["L"] - d["first_dense"]) * active_layer_moe + embed + lm_head + final_norm
+    active_main = d["first_dense"] * layer_dense + (d["L"] - d["first_dense"]) * active_layer_moe + embed + lm_head + final_norm
     active_mtp = active_layer_moe + eh_proj + 2 * H + H
 
     return {
@@ -225,7 +225,7 @@ def flops_prefill(d, T, causal=False):
     moe = flops_layer(d, T, T, dense=False, causal=causal)
     lm_head = 2 * T * d["H"] * d["V"]
     final_norm = 5 * T * d["H"]
-    total = dense["total"] + (d["L"] - d["first_dense"]) * moe["total"] + lm_head + final_norm
+    total = d["first_dense"] * dense["total"] + (d["L"] - d["first_dense"]) * moe["total"] + lm_head + final_norm
     return {
         "dense": dense,
         "moe": moe,
@@ -243,7 +243,7 @@ def flops_decode(d, ctx):
     moe = flops_layer(d, 1, ctx, dense=False)
     lm_head = 2 * d["H"] * d["V"]
     final_norm = 5 * d["H"]
-    total = dense["total"] + (d["L"] - d["first_dense"]) * moe["total"] + lm_head + final_norm
+    total = d["first_dense"] * dense["total"] + (d["L"] - d["first_dense"]) * moe["total"] + lm_head + final_norm
     return {
         "dense": dense,
         "moe": moe,
@@ -265,7 +265,7 @@ def bytes_prefill_weights(d, p, fp32_lm_head=False):
 def bytes_decode_weights(d, p, fp32_lm_head=False):
     """decode 一个 token 只读被激活的专家。"""
     touched = (
-        p["layer_dense"]
+        d["first_dense"] * p["layer_dense"]
         + (d["L"] - d["first_dense"]) * p["active_layer_moe"]
         + d["H"]  # embedding 只读一行
         + p["final_norm"]
@@ -327,7 +327,7 @@ def main():
     p = param_ledger(d)
 
     section("0. config：唯一真源")
-    print(f"  文件              {args.config}")
+    print(f"  文件              {os.path.relpath(args.config)}")
     print(f"  model_type        {c['model_type']} / {c['architectures'][0]}")
     print(f"  hidden_size       {d['H']}")
     print(f"  num_hidden_layers {d['L']}（不含 MTP；MTP 层数 {d['mtp']}）")
@@ -461,9 +461,9 @@ def main():
 
     section("7. 算术强度与 roofline")
     hw = {
-        "h20x8": ("8×H20-3e", 8 * 148e12, 8 * 4.0e12, 8 * 96 * 2**30),
-        "h100x8": ("8×H100 SXM", 8 * 989e12, 8 * 3.35e12, 8 * 80 * 2**30),
-        "m4": ("Apple M4 10-core GPU", 4.6e12, 120e9, 16 * 2**30),
+        "h20x8": ("8×H20-3e", 8 * 148e12, 8 * 4.0e12, 8 * 96e9),
+        "h100x8": ("8×H100 SXM", 8 * 989e12, 8 * 3.35e12, 8 * 80e9),
+        "m4": ("Apple M4 10-core GPU", 4.6e12, 120e9, 16e9),
     }[args.hardware]
     name, peak_flops, peak_bw, mem = hw
     print(f"  机器                        {name}")
