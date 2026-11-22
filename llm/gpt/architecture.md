@@ -232,6 +232,8 @@ step 2: 输入 (1,1)  → K/V cache (1,12,6,64) → scores (1,12,1,6)
 每层缓存两份：K `(1, 12, kv_len, 64)` 和 V `(1, 12, kv_len, 64)`。12 层一共 24 个张量。
 cache 只存历史，不存参数；`kv_len` 从 prompt 长度开始，每生成一个 token 加 1。
 
+注意：增长的是 `kv_len`（cache 长度），不是 `q_len`。decode 的 `q_len` 永远是 1；如果你看到序列在变长，那是 `kv_len` 在长。
+
 ## 4. 参数
 
 ### 4.1 一个 block
@@ -448,6 +450,47 @@ FP16 decode（T=1024）≈ 249M + 38M = 287M / token
 
 GPU 的 `算力/带宽` 比通常几十到几百，1.0 远低于它——**decode 是带宽瓶颈**。
 每生成一个 token 都要搬 249M 权重，算力用不满。
+
+### 6.8 生成 N 个 token 的总时间
+
+decode 第 `t` 步（cache 长度 `t`）的单步访存：
+
+```
+单步字节 = W + t × kv_per_token
+```
+
+- `W` = 权重，每次都要读：FP16 约 249M
+- `kv_per_token` = 每层 K/V 每个 token 的字节：
+  `12 层 × 2 × 768 × 2 B = 36,864 B ≈ 36K`
+
+带宽瓶颈时：
+
+```
+t_step(t) ≈ (W + t × kv_per_token) / BW
+```
+
+生成 `N` 个 token 要把每一步加起来：
+
+```
+T_total ≈ Σ_{t=0}^{N-1} t_step(t)
+        ≈ [N × W + kv_per_token × N(N+1)/2] / BW
+```
+
+以 GPT-2、`N = 1024`、`BW = 120 GB/s` 为例：
+
+```
+权重      1024 × 249M = 255G
+KV cache  36K × 1024×1025/2 ≈ 19.3G
+                        ─────
+合计      ≈ 274G
+274G / 120GB/s ≈ 2.29s
+```
+
+平均约 `2.23 ms/token`；第一个 token 约 `2.08 ms`，最后一个约 `2.39 ms`。
+
+所以：**cache 在长，单步确实越来越慢，但 GPT-2 的 cache 最大只有约 37M，占权重的 15% 左右，整体还是权重主导。**
+KV cache 要超过权重，需要 `T ≈ 249M / 36K ≈ 6,700` 个 token；GPT-2 的 `max_pos = 1024`，到不了。
+长上下文模型（128K）就反过来了：KV cache 会超过权重，成为 decode 的主要访存。
 
 ## 7. GPT 这条线
 
