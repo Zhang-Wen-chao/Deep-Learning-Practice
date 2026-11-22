@@ -38,9 +38,18 @@
 llm/
 ├── README.md                 # 本文件：路线 + 进度
 ├── transformer/
-│   └── architecture.md       # Transformer 架构图 + shape
-└── gpt/
-    └── README.md             # GPT 单栈 + 论文这条线
+│   ├── architecture.md       # Transformer 架构图 + shape + 参数/FLOPs/访存
+│   ├── model.py              # 自写 enc-dec，加载 opus-mt 权重，打印真实 shape
+│   ├── data/pairs.tsv
+│   └── runs/model_py_flow.log
+├── gpt/
+│   ├── README.md             # GPT-2 架构 + shape + 参数/FLOPs/KV cache
+│   ├── model.py              # 自写 GPT-2，加载 HF 权重，prefill + decode
+│   └── runs/gpt2_shapes.log
+└── bert/
+    ├── architecture.md       # BERT 架构图 + shape + 参数/FLOPs/访存
+    ├── model.py              # 自写 encoder-only，加载 bert-base-uncased
+    └── runs/bert_flow.log
 ```
 
 ## 三层目标
@@ -48,7 +57,7 @@ llm/
 | 层 | 目标 | 产出 | 怎么算做完 |
 | --- | --- | --- | --- |
 | **L1 读图** | 看懂架构，**精确**记住 shape | 带形状标注的架构图 + 30 秒口述 | 遮住文档默画，形状零误差；能说出每个维度为什么是这个值 |
-| **L2 真机** | 真实 prompt 喂进去，打印所有真实 shape | `trace_shapes.py` 输出日志 | 每个 module 的 in/out shape 与 L1 预测逐项 diff，**差异为空**；含 prefill 和 decode 两步 |
+| **L2 真机** | 真实 prompt 喂进去，打印所有真实 shape | `model.py` 输出日志 | 每个 module 的 in/out shape 与 L1 预测逐项 diff，**差异为空**；含 prefill 和 decode 两步 |
 | **L3a 理论** | 逐算子算 FLOPs / Bytes，算出"应该是多少时间" | 每个模型一张账表 | 两种算法互相验证相等；能对任意 config 报出参数 / 每层 FLOPs / 每 token FLOPs / decode 字节 |
 | **L3b 实测** | 跑 profiler，填实测列 | 同一张表多两列：`实测 t` / `倍数` | 每个算子误差 < 3×，否则能归因（launch-bound / memory-bound / 算错了） |
 
@@ -64,12 +73,22 @@ llm/
 
 | # | 载体 | 相比上一个新增什么 | L1 | L2 | L3a | L3b |
 | --- | --- | --- | --- | --- | --- | --- |
-| 0 | **Transformer 2017**（enc-dec） | 地基：MHA + FFN + 残差 + LN + 位置编码 | ✅ | ✅ | [ ] | [ ] |
-| 1 | **GPT-2 124M** | decoder-only；删掉 encoder 和 cross-attn；学习式位置编码；weight tying | [ ] | [ ] | ✅ | [ ] |
+| 0 | **Transformer 2017**（enc-dec） | 地基：MHA + FFN + 残差 + LN + 位置编码 | ✅ | ✅ | ✅ | [ ] |
+| 1 | **GPT-2 124M** | decoder-only；删掉 encoder 和 cross-attn；学习式位置编码；weight tying | ✅ | ✅ | ✅ | [ ] |
 | 2 | **HY3** | 待查 config | [ ] | [ ] | [ ] | [ ] |
 | 3 | **HY4 / HY4-Flash** | 待查 config | [ ] | [ ] | [ ] | [ ] |
+| — | **BERT-base**（旁支） | encoder-only；双向、无 causal mask；可学习位置；三种 embedding；MLM 头 | ✅ | ✅ | ✅ | [ ] |
 
 不做：Llama 权重、DeepSeek-V4.1-Flash。
+
+为什么第 1 档是 GPT-2 124M：
+
+- **能真跑**：124M 参数，FP32 约 498MB，prefill 和 decode 都能在这台 M4 上跑完；GPT-3 175B 只能纸面算。
+- **只改四件事**：相对第 0 档，只删 encoder/cross-attn、换学习式位置编码、pre-LN、GELU。一次只加一个维度，shape 差异看得清。
+- **有真实权重**：官方 `config.json` + state_dict + 标准 tokenizer，L2 能对真实张量，不靠背论文。
+- **缺的正好是下一档**：RoPE / GQA / SwiGLU / RMSNorm / MoE 都不在这里加，留到 HY3；否则一次变太多，shape 对不上时分不清是哪一步的锅。
+
+GPT-1 和 GPT-2 是同一套 decoder block，不单独设档；GPT-2 的 medium/large/xl 也只是改 config。GPT-3 没有开放权重，纸面看论文即可，不占一个动手档位。
 
 ## 三条原则
 
@@ -84,15 +103,17 @@ llm/
 
 ## 已知数：GPT-2 124M
 
-纯纸面算的，权重没下载，两种算法（公式 / hook 数真实张量）互相校验过：
+参数是真实 `state_dict` 数的；FLOPs 和字节按公式算。shape 见 `gpt/runs/gpt2_shapes.log`：
 
 | 项 | 值 |
 | --- | --- |
-| 参数 | 124,402,944（官方 124M，对得上说明 config 没记错） |
+| 参数 | 124,439,808（约 124.4M） |
 | prefill `T=1024` | 285M FLOPs / token |
-| decode `T=1` | 247M FLOPs / token |
-| decode 权重 | 249 MB（FP16） |
-| KV cache `T=1024` | 38 MB |
+| decode `T=1` | 247M FLOPs / token（context=1；context=1024 时 attention 再加 ~37.7M） |
+| decode 权重 | 249 MB（FP16；FP32 约 498 MB） |
+| KV cache `T=1024` | 38 MB（FP16） |
+
+> 之前写的 `124,402,944` 少了 12 层 `c_fc` 的 bias（`12 × 3072 = 36,864`）。以真实 `state_dict` 的 **124,439,808** 为准。
 
 decode 每生成一个 token 都要把 249 MB 权重读一遍 —— 这就是带宽瓶颈的来源，
 也是为什么 decode 要看字节而不是 FLOPs。
@@ -100,7 +121,7 @@ decode 每生成一个 token 都要把 249 MB 权重读一遍 —— 这就是�
 ## 这台机器
 
 ```
-Apple M4 / 16 GB / arm64 / 无 CUDA / MPS 可用 / transformers 未装 / tiktoken 已装
+Apple M4 / 16 GB / arm64 / 无 CUDA / MPS 可用 / transformers 装在 ~/.venvs/llm-gpt / tiktoken 已装
 ```
 
 L1 / L2 / L3a 都能做。L3b 等换机器：只需测本机的两个常数（可达算力、可达带宽），
@@ -108,6 +129,8 @@ L1 / L2 / L3a 都能做。L3b 等换机器：只需测本机的两个常数（�
 
 ## 下一步
 
-- [ ] `pip install transformers`
-- [ ] 写 `trace_shapes.py`：GPT-2 真实 prompt，存 `runs/gpt2_shapes.log`，和 L1 预测 diff
-- [ ] GPT-2 的 L1：默画单栈（图在 `gpt/README.md`），零误差
+- [x] `transformers` 装到 `~/.venvs/llm-gpt`
+- [x] GPT-2 `model.py` + `runs/gpt2_shapes.log`（prefill + decode 都有）
+- [x] GPT-2 的 L1：单栈、causal mask、KV cache、参数量/FLOPs/访存
+- [ ] HY3：拿到 config 后，按 `hidden_size / num_attention_heads / num_key_value_heads / intermediate_size / num_experts / moe_top_k` 逐项对
+- [ ] L3b：换机器后跑 profiler，把 `实测 t / 倍数` 填进账表
