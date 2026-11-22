@@ -24,8 +24,8 @@ GPT-2 做的是**下一 token 预测**：给一段文本，预测下一个 token
 | `q_len` | 当前这次 forward 的 query 数：prefill = `seq_len`，decode = 1 |
 | `kv_len` | K/V 的长度：prefill = `seq_len`，decode = 历史长度 + 1 |
 | `max_pos` | 位置嵌入表的最大长度，GPT-2 是 1024 |
-| `c_attn` | 一个 Linear 一次算出 Q/K/V：768 → 2304，再切成三份 |
-| `wte` / `wpe` | token embedding / 可学习位置 embedding |
+| `c_attn` | combined attention：一个 Linear 一次算出 Q/K/V：768 → 2304，再切成三份 |
+| `wte` / `wpe` | weight token embedding / weight position embedding |
 | KV cache | decode 时缓存每层历史 K/V，避免重算 |
 
 GPT-2 124M 的配置。本地 [`config.json`](config.json) 是 Hugging Face 官方 config 的副本，`model.py` 直接读它；下表是字段映射：
@@ -97,7 +97,13 @@ flowchart TB
 
 ### 3.3 c_attn 和 wte / wpe
 
-这三个名字来自 GPT-2 的实现，不是论文里的数学符号。图里出现过，这里拆开看。
+这三个名字来自 GPT-2 的实现，不是论文里的数学符号。先把全称写出来：
+
+- `c_attn` = **combined attention**：把 Q/K/V 三个投影合在一个 Linear 里
+- `wte` = **weight token embedding**：token 的嵌入权重矩阵
+- `wpe` = **weight position embedding**：位置的嵌入权重矩阵
+
+图里出现过，这里拆开看。
 
 #### c_attn：一次算出 Q/K/V
 
@@ -136,10 +142,15 @@ GPT-2 的第一行不是矩阵乘，是两次查表：
 x = wte[token_ids] + wpe[positions]
 ```
 
-| 名字 | 形状 | 输入 | 输出 | 是否训练 |
-| --- | --- | --- | --- | --- |
-| `wte` | 50257 × 768 | token id | 768 维向量 | 是 |
-| `wpe` | 1024 × 768 | 位置 `0…T-1` | 768 维向量 | 是 |
+`wte` = **w**eight **t**oken **e**mbedding，`wpe` = **w**eight **p**osition **e**mbedding。
+`w` 表示这是一个权重矩阵，`te` / `pe` 分别是 token embedding / position embedding。
+
+“查表”就是按 id 取矩阵的一行，不做乘法：`wte[token_ids]` 的输出形状是 `(B, T, 768)`，因为每个 token id 选出一行 768 维向量。
+
+| 名字 | 全称 | 形状 | 输入 | 输出 | 是否训练 |
+| --- | --- | --- | --- | --- | --- |
+| `wte` | weight token embedding | 50257 × 768 | token id | 768 维向量 | 是 |
+| `wpe` | weight position embedding | 1024 × 768 | 位置 `0…T-1` | 768 维向量 | 是 |
 
 - `wte`：词表里每个 token 一行。`"A long time ago"` 切成 `[32, 890, 640, 2084]`，查出来就是 `(1, 4, 768)`。
 - `wpe`：每个位置一行。位置 `0, 1, 2, 3` 查出来是 `(4, 768)`，广播到 batch 维后相加，得到 `(1, 4, 768)`。
@@ -155,7 +166,7 @@ wpe[0..3]        (4, 768)
 相加              (1, 4, 768)
 ```
 
-> `wte` / `wpe` 是 OpenAI GPT-2 代码里的名字：**w**eight **t**oken **e**mbedding / **w**eight **p**osition **e**mbedding。Hugging Face 里叫 `transformer.wte` / `transformer.wpe`。
+> 这套命名来自 OpenAI 的 GPT-2 代码；Hugging Face 里叫 `transformer.wte` / `transformer.wpe`。
 
 ### 3.4 causal mask
 
