@@ -153,7 +153,7 @@ class CausalSelfAttention(nn.Module):
         out = out.transpose(1, 2).contiguous().view(b, q_len, d)   # (b, q_len, dim_model)
         trace("拼头", out, f"{self.heads} 个头 view({b},{q_len},{d})，无计算")
         out = self.c_proj(out)                      # (b, q_len, dim_model)
-        trace("c_proj", out, f"拼接结果{sp(out)} @ Wᵀ{sp(self.c_proj.weight)} + b{sp(self.c_proj.bias)}")
+        trace("c_proj (attn)", out, f"拼接结果{sp(out)} @ Wᵀ{sp(self.c_proj.weight)} + b{sp(self.c_proj.bias)}")
         return out, (k, v)
 
 
@@ -171,7 +171,7 @@ class MLP(nn.Module):
         h = F.gelu(h, approximate="tanh")           # (b, q_len, dim_ff)
         trace("gelu", h, "逐元素，形状不变（GPT-2 用 tanh 近似）")
         h = self.c_proj(h)                          # (b, q_len, dim_model)
-        trace("c_proj", h, f"h{sp(h)} @ Wᵀ{sp(self.c_proj.weight)} + b{sp(self.c_proj.bias)}")
+        trace("c_proj (mlp)", h, f"h{sp(h)} @ Wᵀ{sp(self.c_proj.weight)} + b{sp(self.c_proj.bias)}")
         return h
 
 

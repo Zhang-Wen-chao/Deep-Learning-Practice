@@ -25,6 +25,7 @@ GPT-2 做的是**下一 token 预测**：给一段文本，预测下一个 token
 | `kv_len` | K/V 的长度：prefill = `seq_len`，decode = 历史长度 + 1 |
 | `max_pos` | 位置嵌入表的最大长度，GPT-2 是 1024 |
 | `c_attn` | combined attention：一个 Linear 一次算出 Q/K/V：768 → 2304，再切成三份 |
+| `c_proj` | Conv1D projection：attention 的 `c_proj` 就是 `out_proj`，MLP 的 `c_proj` 就是 `fc2` |
 | `wte` / `wpe` | weight token embedding / weight position embedding |
 | KV cache | decode 时缓存每层历史 K/V，避免重算 |
 
@@ -97,11 +98,12 @@ flowchart TB
 | FFN 激活 | ReLU | GELU（tanh 近似） |
 | Q/K/V | 三个独立 Linear | 一个 `c_attn`（768→2304），再切 |
 
-### 3.3 c_attn 和 wte / wpe
+### 3.3 c_attn / c_proj 和 wte / wpe
 
 这三个名字来自 GPT-2 的实现，不是论文里的数学符号。先把全称写出来：
 
 - `c_attn` = **combined attention**：把 Q/K/V 三个投影合在一个 Linear 里
+- `c_proj` = **Conv1D projection**：GPT-2 对 Linear 的叫法；attention 里的 `c_proj` 就是 `out_proj`，MLP 里的 `c_proj` 就是 `fc2`
 - `wte` = **weight token embedding**：token 的嵌入权重矩阵
 - `wpe` = **weight position embedding**：位置的嵌入权重矩阵
 
@@ -135,6 +137,19 @@ q, k, v = qkv.split(768, dim=-1)
 然后再拆头：`(B, T, 768) → (B, 12, T, 64)`。
 
 数学上和三套独立 Linear 完全等价；合成一个只是少两次矩阵乘、实现更紧凑。Hugging Face 的 checkpoint 把它存成 Conv1D，权重形状是 `(768, 2304)`（in, out）；本文件的 `nn.Linear` 要 `(2304, 768)`（out, in），所以加载时转置。
+
+#### c_proj：两个 c_proj，别混
+
+`c_proj` = **Conv1D projection**。GPT-2 把线性层实现成 1×1 卷积，所以名字里带 `c`；它和 `nn.Linear` 做的是同一件事。
+
+一个 block 里有两个 `c_proj`：
+
+| 位置 | 对应 Transformer 的名字 | 形状 |
+| --- | --- | --- |
+| attention 输出 | `out_proj` / `Wo` | `(B, T, 768) @ (768, 768)` |
+| MLP 输出 | `fc2` / `W2` | `(B, T, 3072) @ (3072, 768)` |
+
+log 里两行都叫 `c_proj`，看上下文：`拼头` 之后的是 attention 的，`gelu` 之后的是 MLP 的。现在 trace 已经分别写成 `c_proj (attn)` 和 `c_proj (mlp)`。
 
 #### wte / wpe：两张查找表
 
@@ -201,9 +216,9 @@ scores         (1, 12, 4, 4)   ← 唯一的 T×T
 softmax        (1, 12, 4, 4)
 attn @ V       (1, 12, 4, 64)
 拼头            (1, 4, 768)
-c_proj         (1, 4, 768)
+c_proj (attn)  (1, 4, 768)
 c_fc           (1, 4, 3072)
-c_proj         (1, 4, 768)
+c_proj (mlp)   (1, 4, 768)
 lm_head        (1, 4, 50257)   ← 只取最后一个位置
 ```
 
