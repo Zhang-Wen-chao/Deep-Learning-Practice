@@ -41,6 +41,8 @@ GPT-2 124M 的配置。本地 [`config.json`](config.json) 是 Hugging Face 官�
 | `max_pos` | 1024 | `n_positions` / `n_ctx` |
 | 参数 | **124,439,808** | 由真实 `state_dict` 数出 |
 
+`batch_size` 和 `seq_len` 不在 `config.json` 里：它们是运行时输入。`config.json` 只给 `seq_len` 的上限 `n_positions = 1024`，不给具体这次输入几个 token。
+
 ## 3. 结构
 
 ### 3.1 怎么读图
@@ -145,7 +147,7 @@ x = wte[token_ids] + wpe[positions]
 `wte` = **w**eight **t**oken **e**mbedding，`wpe` = **w**eight **p**osition **e**mbedding。
 `w` 表示这是一个权重矩阵，`te` / `pe` 分别是 token embedding / position embedding。
 
-“查表”就是按 id 取矩阵的一行，不做乘法：`wte[token_ids]` 的输出形状是 `(B, T, 768)`，因为每个 token id 选出一行 768 维向量。
+“查表”就是按 id 取矩阵的一行，不做乘法：`wte[token_ids]` 的输出形状是 `(batch_size, seq_len, 768)`。`50257` 和 `768` 来自 `config.json`；`seq_len` 是这次输入的 token 数，运行时才知道，`config.json` 只给上限 `n_positions = 1024`。
 
 | 名字 | 全称 | 形状 | 输入 | 输出 | 是否训练 |
 | --- | --- | --- | --- | --- | --- |
