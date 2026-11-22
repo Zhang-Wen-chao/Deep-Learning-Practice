@@ -1,0 +1,44 @@
+model: bert-base-uncased
+  加载 207 个张量
+  多余: ['cls.seq_relationship.weight', 'cls.seq_relationship.bias']
+参数: 110,104,890
+
+[1] tokenizer
+  text      'The capital of France is [MASK].'
+  ids       [101, 1996, 3007, 1997, 2605, 2003, 103, 1012, 102]...
+  形状      (1,9)  seq_len = 9
+
+[2] 前向
+── embedding ─────────────────────────────────
+  word_emb                (1,9,768)                 查表
+  pos_emb                 (1,9,768)                 可学习，不是 sin/cos
+  token_type_emb          (1,9,768)                 句子 A=0 / B=1
+  三者相加                    (1,9,768)                 宽度不变
+  LayerNorm               (1,9,768)                 embedding 后还有一次 LN
+── layer 0（细节） ───────────────────────────────
+  q/k/v 拆头                (1,12,9,64)               (1,12,9,64)
+  scores                  (1,12,9,9)                9×9 双向，不遮
+  softmax                 (1,12,9,9)                
+  拼头                      (1,9,768)                 输出投影在 BertAttention 里
+  out_dense               (1,9,768)                 
+  + 残差 + LN               (1,9,768)                 post-LN
+  intermediate            (1,9,3072)                变宽 ×4
+  output.dense            (1,9,768)                 变回
+  + 残差 + LN               (1,9,768)                 
+layer 1–11              (1,9,768)                 内部同第 0 层
+[CLS]                   (1,768)                   取第 0 个位置
+pooler                  (1,768)                   分类/句向量用这个
+── MLM 头 ─────────────────────────────────────
+  transform + gelu        (1,9,768)                 
+  LayerNorm               (1,9,768)                 
+  decoder                 (1,9,30522)               dim_model → vocab_size
+
+[3] 预测 [MASK]
+  41.68%  'paris'
+   7.14%  'lille'
+   6.34%  'lyon'
+   4.44%  'marseille'
+   3.03%  'tours'
+
+[4] [CLS] 向量
+  pooled 形状 (1,768)  ← 分类头就用这个
