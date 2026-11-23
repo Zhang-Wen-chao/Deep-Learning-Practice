@@ -200,6 +200,10 @@ prefill 时 `q_len = kv_len = seq_len`，mask 是下三角（行是 q、列是 k
 
 decode 时 `q_len = 1`，新的 query 可以看全部历史 K/V，所以 `scores` 是 `(batch_size, num_heads, 1, kv_len)`，不需要再遮未来——未来还没进 cache。
 
+> **实现注记**：朴素写法会先算满 `T×T` 再 `masked_fill`，QK/AV 各浪费约一半。实际推理用 FlashAttention / `F.scaled_dot_product_attention(is_causal=True)`，在 kernel 内按块跳过右上角，不 materialize 整张 `scores`。`model.py` 为了打印 shape，保留了朴素写法。
+>
+> 不能直接改 Q/K 来“加 mask”：mask 是 `(i,j)` 的配对关系，不是单个 token 的属性。可以在 `scores` 上加位置 bias（如 ALiBi），或者用 RoPE 改 Q/K 的相对位置，但因果截断仍然发生在 `scores` / softmax 这一层。
+
 ### 3.5 prefill 和 decode
 
 `runs/gpt2_shapes.log` 是用真实 GPT-2 权重跑出来的，prompt 是 `"A long time ago"`（4 个 token）。
