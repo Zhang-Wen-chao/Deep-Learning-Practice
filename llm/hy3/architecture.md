@@ -193,7 +193,7 @@ HY3 的 Linear 没有 bias（`attention_bias=false`、`mlp_bias=false`），所�
 | `repeat_kv` | `(1, 64, seq_len, 128)` | 概念上每个 KV 头复制 8 份 |
 | `scores = q @ kᵀ` | `(1, 64, seq_len, seq_len)` | 除以 `√128`，加 causal mask |
 | `softmax` | `(1, 64, seq_len, seq_len)` | 最后一维归一化 |
-| `attn @ V` | `(1, 64, seq_len, 128)` | 加权求和 |
+| `P @ V` | `(1, 64, seq_len, 128)` | 加权求和 |
 | 拼头 | `(1, seq_len, 8192)` | 64×128 拼回 8192 |
 | `o_proj` | `(1, seq_len, 4096)` | `拼接结果 @ Woᵀ(8192, 4096)` |
 | `+ residual` | `(1, seq_len, 4096)` | 逐元素 |
@@ -226,7 +226,7 @@ HY3 的 Linear 没有 bias（`attention_bias=false`、`mlp_bias=false`），所�
 | `repeat_kv` | `(1, 64, kv_len, 128)` | 概念上 |
 | `scores` | `(1, 64, 1, kv_len)` | q_len = 1，kv_len = 历史 + 1 |
 | `softmax` | `(1, 64, 1, kv_len)` | 每个 Q 对全部历史归一化 |
-| `attn @ V` | `(1, 64, 1, 128)` | 加权求和 |
+| `P @ V` | `(1, 64, 1, 128)` | 加权求和 |
 | `o_proj` | `(1, 1, 4096)` | `拼接结果 @ Woᵀ(8192, 4096)` |
 | MoE | `(1, 4096) → (1, 4096)` | 1 个 token 选 8 个专家；block 0 换成 dense FFN |
 | `lm_head` | `(1, 1, 120832)` | `y @ Wᵀ(4096, 120832)`，只取最后一个位置 |
@@ -579,7 +579,7 @@ MoE 层拆开（`seq_len = 4096`）：
 | 子项 | FLOPs | 占比 |
 | --- | --- | --- |
 | attention Q/K/V/O | 618.475 G | 24.0% |
-| scores + attn@V | 549.756 G | 21.4% |
+| scores + P@V | 549.756 G | 21.4% |
 | top-8 experts | 1.237 T | 48.1% |
 | shared expert | 154.619 G | 6.0% |
 | router | 6.442 G | 0.25% |
@@ -606,7 +606,7 @@ MoE 层拆开：
 | 子项 | FLOPs | 说明 |
 | --- | --- | --- |
 | Q/K/V/O | 150.995 M | 只算新 token |
-| scores + attn@V | 4.295 G | `4 × kv_len × 64 × 128` |
+| scores + P@V | 4.295 G | `4 × kv_len × 64 × 128` |
 | top-8 experts | 301.990 M | 8 × 6×H×Im |
 | shared expert | 37.749 M | 6×H×Im |
 | router | 1.573 M | `2×H×E` |

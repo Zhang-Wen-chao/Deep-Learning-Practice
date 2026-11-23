@@ -396,7 +396,7 @@ def sum_min(T, k):
 
 
 def flops_attn_core_decode(d, ctx):
-    """decode 1 token 的 QK^T + attn@V；C 是可见上下文长度（含自己）。"""
+    """decode 1 token 的 QK^T + P@V；C 是可见上下文长度（含自己）。"""
     sp = d["n_sparse"] * d["heads"] * min(ctx, d["index_topk"])
     sw = d["n_sliding"] * d["swa_heads"] * min(ctx, d["sliding"])
     qk = 2 * (sp + sw) * d["qk_dim"]
@@ -405,7 +405,7 @@ def flops_attn_core_decode(d, ctx):
 
 
 def flops_attn_core_prefill(d, T):
-    """prefill T 个 token 的 QK^T + attn@V，按 causal 求和。"""
+    """prefill T 个 token 的 QK^T + P@V，按 causal 求和。"""
     sp_pairs = d["n_sparse"] * d["heads"] * sum_min(T, d["index_topk"])
     sw_pairs = d["n_sliding"] * d["swa_heads"] * sum_min(T, d["sliding"])
     qk = 2 * (sp_pairs + sw_pairs) * d["qk_dim"]
@@ -674,9 +674,9 @@ def main():
     section(f"4. FLOPs：prefill T={args.prefill:,}")
     pre = flops_prefill(d, args.prefill, p["active_no_embed"])
     print(f"  线性层（2 × 激活参数 × T）  {rate(pre['linear'])}")
-    print(f"  attention QK^T + attn@V     {rate(pre['attn_core'])}")
+    print(f"  attention QK^T + P@V     {rate(pre['attn_core'])}")
     print(f"    QK^T                      {rate(pre['qk'])}")
-    print(f"    attn@V                    {rate(pre['av'])}")
+    print(f"    P@V                    {rate(pre['av'])}")
     if pre["indexer"]:
         print(f"  DSA indexer 打分（eager）   {rate(pre['indexer'])}")
         print(f"    causal 下界（约一半）     {rate(pre['indexer_causal'])}")
@@ -692,9 +692,9 @@ def main():
     section(f"5. FLOPs：decode 1 token（上下文 {args.context:,}）")
     dec = flops_decode(d, args.context, p["active_no_embed"])
     print(f"  线性层（2 × 激活参数）      {rate(dec['linear'])}")
-    print(f"  attention QK^T + attn@V     {rate(dec['attn_core'])}")
+    print(f"  attention QK^T + P@V     {rate(dec['attn_core'])}")
     print(f"    QK^T                      {rate(dec['qk'])}")
-    print(f"    attn@V                    {rate(dec['av'])}")
+    print(f"    P@V                    {rate(dec['av'])}")
     if dec["indexer"]:
         print(f"  DSA indexer 打分            {rate(dec['indexer'])}")
         print(f"  DSA indexer 池化（eager）   {rate(dec['indexer_pool'])}  ← 优化 kernel 可缓存")

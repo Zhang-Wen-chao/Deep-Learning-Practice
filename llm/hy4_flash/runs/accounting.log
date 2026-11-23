@@ -93,9 +93,9 @@
 4. FLOPs：prefill T=4,096
 ==============================================================================
   线性层（2 × 激活参数 × T）  92.329 T
-  attention QK^T + attn@V     6.340 T
+  attention QK^T + P@V     6.340 T
     QK^T                      3.170 T
-    attn@V                    3.170 T
+    P@V                    3.170 T
   DSA indexer 打分（eager）   207.769 G
     causal 下界（约一半）     103.885 G
   DSA indexer 池化（eager）   3.221 G
@@ -109,9 +109,9 @@
 5. FLOPs：decode 1 token（上下文 131,072）
 ==============================================================================
   线性层（2 × 激活参数）      22.541 G
-  attention QK^T + attn@V     1.812 G
+  attention QK^T + P@V     1.812 G
     QK^T                      905.970 M
-    attn@V                    905.970 M
+    P@V                    905.970 M
   DSA indexer 打分            1.623 G
   DSA indexer 池化（eager）   103.079 G  ← 优化 kernel 可缓存
   合计（不含池化）            25.976 G FLOPs/token

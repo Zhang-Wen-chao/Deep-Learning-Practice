@@ -92,7 +92,7 @@ flowchart TD
 | q/k/v 拆头 | `(1, 12, 9, 64)` |
 | scores | `(1, 12, 9, 9)` |
 | softmax | `(1, 12, 9, 9)` |
-| attn @ V + 拼头 | `(1, 9, 768)` |
+| P @ V + 拼头 | `(1, 9, 768)` |
 | intermediate | `(1, 9, 3072)` |
 | output.dense | `(1, 9, 768)` |
 | [CLS] | `(1, 768)` |
@@ -197,7 +197,7 @@ BERT 里每个 Linear 的 `m` 都是 `seq_len`，`k × n` 是权重个数。本�
 | `k_proj` | 同上 | | 10.4M | 8.3% |
 | `v_proj` | 同上 | | 10.4M | 8.3% |
 | `scores` | `2 × num_attention_heads × seq_len × seq_len × head_dim` | `2 × 12 × 9×9 × 64` | 124K | 0.1% |
-| `attn @ V` | 同上 | | 124K | 0.1% |
+| `P @ V` | 同上 | | 124K | 0.1% |
 | `out_proj` | `2 × seq_len × 768 × 768` | `2 × 9 × 576K` | 10.4M | 8.3% |
 | `intermediate` | `2 × seq_len × 768 × 3072` | `2 × 9 × 2,304K` | 41.5M | 33.3% |
 | `output.dense` | `2 × seq_len × 3072 × 768` | `2 × 9 × 2,304K` | 41.5M | 33.3% |
@@ -222,7 +222,7 @@ MLM 头展开：`9 × 768 × 30522 = 9 × 23.4M = 211M` 次乘加，`× 2 = 422M
 
 ### 长上下文：注意力的平方项
 
-`seq_len = 9` 时 `scores` 和 `attn @ V` 只有 124K，可以忽略。但它是 `O(seq_len²)`：
+`seq_len = 9` 时 `scores` 和 `P @ V` 只有 124K，可以忽略。但它是 `O(seq_len²)`：
 
 ```
 2 × num_attention_heads × seq_len × seq_len × head_dim
@@ -264,7 +264,7 @@ BERT 只有**一次前向**，没有 prefill / decode 之分：输入进去，�
 | `scores` | 0（无参数） | `(1,12,9,9)` 的读写 | 0.01M |
 | **小计** | | | **≈9.2M** |
 
-`scores` / `softmax` / `attn @ V` 没有权重，只有 `9×9` 的中间张量，可以忽略。
+`scores` / `softmax` / `P @ V` 没有权重，只有 `9×9` 的中间张量，可以忽略。
 
 ### ② FFN
 

@@ -233,7 +233,7 @@ DSA mask     每个 query 只留 top-2048 个 key
 causal mask  再叠下三角
 sink         每个头多一个可学习 logit，拼在 softmax 分母里
 softmax      over (选中 key + 1 个 sink)，丢掉 sink 那一列
-attn @ V                           (B,64,S,256)
+P @ V                           (B,64,S,256)
 gate         gate_proj(hidden)     (B,S,64,256) → sigmoid
 attn * gate                        (B,S,64,256)
 reshape                            (B,S,16384)
@@ -498,7 +498,7 @@ DFly2 只在投机解码时启动，不算进主模型的每 token 激活。
 
 ## 6. FLOPs
 
-口径：矩阵乘 `(m,k)@(k,n)` 算 `2mkn` FLOPs；attention 的 `QKᵀ` 和 `attn@V`
+口径：矩阵乘 `(m,k)@(k,n)` 算 `2mkn` FLOPs；attention 的 `QKᵀ` 和 `P@V`
 单独算；norm / sigmoid / SiLU 这类逐元素算子不进主表（占比 <1%）。
 
 ### 6.1 每 token

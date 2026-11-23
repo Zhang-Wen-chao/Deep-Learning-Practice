@@ -477,7 +477,7 @@ embedding 查表（不是矩阵乘）。
 
 ### 5.2 Attention core
 
-QK^T 和 attn@V 不包含在"激活参数×2"里，要单独加：
+QK^T 和 P@V 不包含在"激活参数×2"里，要单独加：
 
 ```
 QK   = 2 × h × Σ_i min(i, K) × D_qk

@@ -145,11 +145,11 @@ class CausalSelfAttention(nn.Module):
         else:
             trace("+ causal mask", scores, f"{q_len}×{kv_len}，没有未来位置可遮")
 
-        attn = scores.softmax(-1)                   # (b, heads, q_len, kv_len)
-        trace("softmax", attn, "dim=-1，每个 query 对全部 key 归一化")
+        P = scores.softmax(-1)                      # (b, heads, q_len, kv_len)
+        trace("softmax → P", P, "dim=-1，每个 query 对全部 key 归一化")
 
-        out = attn @ v                              # (b, heads, q_len, dim_k)
-        trace("attn @ V", out, f"Σ_k attn{sp(attn)}·v{sp(v)}，加权平均")
+        out = P @ v                                 # (b, heads, q_len, dim_k)
+        trace("P @ V", out, f"Σ_k P{sp(P)}·v{sp(v)}，加权平均")
         out = out.transpose(1, 2).contiguous().view(b, q_len, d)   # (b, q_len, dim_model)
         trace("拼头", out, f"{self.heads} 个头 view({b},{q_len},{d})，无计算")
         out = self.c_proj(out)                      # (b, q_len, dim_model)

@@ -78,7 +78,7 @@
   MoE 层（每层）              2.572 T FLOPs
     attention                 1.174 T
       q/k/v/o                 618.475 G
-      scores + attn@V         549.756 G
+      scores + P@V         549.756 G
     MoE                       1.398 T
       router                  6.442 G
       top-8 experts           1.237 T
@@ -100,7 +100,7 @@
   MoE 层（每层）              4.829 G FLOPs
     attention                 4.488 G
       q/k/v/o（只算新 token）  150.995 M
-      scores + attn@V（kv_len 项）  4.295 G
+      scores + P@V（kv_len 项）  4.295 G
     MoE                       341.311 M
   79 个 MoE 层合计          381.523 G
   lm_head                     989.856 M

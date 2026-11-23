@@ -454,7 +454,7 @@ src_len 输入宽   输出宽
 | `k_proj` | 同上 | | 2.50M | 8.3% |
 | `v_proj` | 同上 | | 2.50M | 8.3% |
 | `scores` | `2 × num_heads × src_len × src_len × dim_k` | `2×8×5×5×64` | 25K | 0.08% |
-| `attn @ V` | 同上 | | 25K | 0.08% |
+| `P @ V` | 同上 | | 25K | 0.08% |
 | `out_proj` | `2 × src_len × dim_model × dim_model` | `2×5×512×512` | 2.50M | 8.3% |
 | `LayerNorm` | `5（每元素 5 次）× src_len × dim_model` | `5 × 5 × 512` | 12.5K | 0.04% |
 | **`fc1`** | `2 × src_len × dim_model × dim_ff` | `2×5×512×2048` | **10.00M** | **33.2%** |
@@ -486,7 +486,7 @@ src_len 输入宽   输出宽
 | --- | --- | --- | --- |
 | `q/k/v/out_proj` | `4 × 2 × tgt_len × dim_model²` | `4×2×3×512×512` | 6.00M |
 | `scores` | `2 × num_heads × tgt_len × tgt_len × dim_k` | `2×8×3×3×64` | 9.2K |
-| `attn @ V` | 同上 | | 9.2K |
+| `P @ V` | 同上 | | 9.2K |
 | **小计** | | | **6.02M** |
 
 ② cross-attention（Q 来自 decoder，K/V 来自 `enc_out`）：
@@ -497,7 +497,7 @@ src_len 输入宽   输出宽
 | `k_proj` | `2 × src_len × dim_model²` | `2×5×512×512` | 2.50M |
 | `v_proj` | `2 × src_len × dim_model²` | `2×5×512×512` | 2.50M |
 | `scores` | `2 × num_heads × tgt_len × src_len × dim_k` | `2×8×3×5×64` | 15K |
-| `attn @ V` | 同上 | | 15K |
+| `P @ V` | 同上 | | 15K |
 | `out_proj` | `2 × tgt_len × dim_model²` | `2×3×512×512` | 1.50M |
 | **小计** | | | **8.03M** |
 
@@ -548,7 +548,7 @@ decoder  156.5M
 
 #### 长上下文：注意力的平方项
 
-`src_len = 5` 时，`scores` 和 `attn @ V` 加起来只有 `51.2K`，可以忽略。
+`src_len = 5` 时，`scores` 和 `P @ V` 加起来只有 `51.2K`，可以忽略。
 但它们随序列长度平方增长（`O(seq_len²)`）：
 
 ```

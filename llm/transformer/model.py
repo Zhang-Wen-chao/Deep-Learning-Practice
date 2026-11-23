@@ -9,7 +9,7 @@ tokenizer → 加载权重 → 加载数据 → encoder → decoder → 训练 �
     tgt_len      目标句 token 数
     q_len        Q 的长度（query 有几个位置）
     kv_len       K 和 V 的长度（两者必然相等：由同一个输入投影出来，
-                 并且 attn @ V 要求它对得上 scores 的最后一维）
+                 并且 P @ V 要求它对得上 scores 的最后一维）
     dim_model    主干宽度（512）
     num_heads    头数（8）
     dim_k        每头维度 = dim_model / num_heads（64）
@@ -159,13 +159,13 @@ class Attention(nn.Module):
         if mask is not None:
             scores = scores.masked_fill(mask[:q_len, :kv_len], float("-inf"))   # (batch_size, num_heads, q_len, kv_len)
             trace("+ mask", scores, "右上角填 -inf（遮住）")
-        attn = scores.softmax(-1)                                   # 在最后一维(kv_len)归一化，每个 query 的权重和=1
+        P = scores.softmax(-1)                                      # 在最后一维(kv_len)归一化，每个 query 的权重和=1
         #                                                            (batch_size, num_heads, q_len, kv_len)
-        trace("softmax", attn, "= attn 权重；dim=-1，每个 query 对全部 key 归一化")
+        trace("softmax → P", P, "P 是概率矩阵；dim=-1，每个 query 对全部 key 归一化")
 
-        # 加权求和：out[q] = Σ_k attn[q,k] · v[k]，中间那维 kv_len 被求和掉
-        out = attn @ v                                              # (batch_size, num_heads, q_len, dim_k)
-        trace("attn @ V", out, f"Σ_k attn{sp(attn)}·v{sp(v)}，加权平均")
+        # 加权求和：out[q] = Σ_k P[q,k] · v[k]，中间那维 kv_len 被求和掉
+        out = P @ v                                                 # (batch_size, num_heads, q_len, dim_k)
+        trace("P @ V", out, f"Σ_k P{sp(P)}·v{sp(v)}，加权平均")
         out = out.transpose(1, 2).contiguous().view(b, q_len, d)     # (batch_size, q_len, dim_model)
         trace("拼头", out, f"{self.heads} 个头的输出 view({b},{q_len},{d})，无计算 → 该位置的上下文向量")
         out = self.out_proj(out)                                    # (batch_size, q_len, dim_model)

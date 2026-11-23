@@ -267,7 +267,7 @@ def flops(c, active_compute, kv_len):
 
     # 所有矩阵乘（包含 MoE 的 top-k 专家、lm_head、iHC、indexer 投影）
     proj = 2 * active_compute
-    # MLA 的 QK^T + attn @ V；DSA 只看 top-k 个 key
+    # MLA 的 QK^T + P @ V；DSA 只看 top-k 个 key
     lk = min(kv_len, topk)
     attn_core = n_layers(c) * (2 * heads * lk * (qn + qr) + 2 * heads * lk * vh)
     # indexer 打分要扫满 kv_len，只有 full 层做
