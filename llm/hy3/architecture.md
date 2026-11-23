@@ -174,6 +174,9 @@ flowchart TD
 ### 3.3 一个 block 的 shape
 
 下面默认 `batch_size = 1`；prefill 取 `seq_len = 4096`，decode 取 `q_len = 1`、`kv_len = 131072`。
+表里以 **block 1（MoE）** 为例；block 0 是 dense，把 router/experts 换成
+`gate_proj (1, seq_len, 13312)`、`up_proj (1, seq_len, 13312)`、`down_proj (1, seq_len, 4096)`。
+HY3 的 Linear 没有 bias（`attention_bias=false`、`mlp_bias=false`），所以只写 `W`，不写 `+ b`。
 
 #### 3.3.1 prefill（一次喂 seq_len 个 token）
 
@@ -181,8 +184,8 @@ flowchart TD
 | --- | --- | --- |
 | `x` | `(1, seq_len, 4096)` | 上一层输出 |
 | `input_layernorm` | `(1, seq_len, 4096)` | RMSNorm，每 token 独立 |
-| `q_proj` | `(1, seq_len, 8192)` | 4096 → 64×128 |
-| `k_proj` / `v_proj` | `(1, seq_len, 1024)` | 4096 → 8×128 |
+| `q_proj` | `(1, seq_len, 8192)` | `x @ Wqᵀ(4096, 8192)` |
+| `k_proj` / `v_proj` | `(1, seq_len, 1024)` | `x @ Wkᵀ / Wvᵀ(4096, 1024)` |
 | `q` 拆头 | `(1, 64, seq_len, 128)` | `view(1, seq_len, 64, 128)` 后 `.transpose(1, 2)` |
 | `k` / `v` 拆头 | `(1, 8, seq_len, 128)` | 同上（KV 头 8 个） |
 | `q_norm` / `k_norm` | `(1, 64, seq_len, 128)` / `(1, 8, seq_len, 128)` | 最后一维 128 上做 RMSNorm |
@@ -192,15 +195,15 @@ flowchart TD
 | `softmax` | `(1, 64, seq_len, seq_len)` | 最后一维归一化 |
 | `attn @ V` | `(1, 64, seq_len, 128)` | 加权求和 |
 | 拼头 | `(1, seq_len, 8192)` | 64×128 拼回 8192 |
-| `o_proj` | `(1, seq_len, 4096)` | 8192 → 4096 |
+| `o_proj` | `(1, seq_len, 4096)` | `拼接结果 @ Woᵀ(8192, 4096)` |
 | `+ residual` | `(1, seq_len, 4096)` | 逐元素 |
 | `post_attention_layernorm` | `(1, seq_len, 4096)` | 第二个 RMSNorm |
 | `x` flatten | `(seq_len, 4096)` | MoE 按 token 路由 |
-| `router` | `(seq_len, 192)` | `x @ W_rᵀ`，fp32 |
+| `router` | `(seq_len, 192)` | `x @ W_rᵀ(4096, 192)`，fp32 |
 | `top-k` | `(seq_len, 8)` | 选 8 个专家 |
-| 每个专家 `gate_up` | `(n_e, 3072)` | `n_e ≈ seq_len × 8 / 192` |
-| 每个专家 `down` | `(n_e, 4096)` | 1536 → 4096 |
-| shared expert | `(seq_len, 1536) → (seq_len, 4096)` | 永远算 |
+| 每个专家 `gate_up` | `(n_e, 3072)` | `x_e @ W_gu[e]ᵀ(4096, 3072)`；`n_e ≈ seq_len × 8 / 192` |
+| 每个专家 `down` | `(n_e, 4096)` | `h_e @ W_d[e]ᵀ(1536, 4096)` |
+| shared expert | `(seq_len, 1536) → (seq_len, 4096)` | `x @ W_gateᵀ / W_upᵀ(4096, 1536) → W_downᵀ(1536, 4096)` |
 | 合并 | `(seq_len, 4096) → (1, seq_len, 4096)` | `routed + shared` |
 | `+ residual` | `(1, seq_len, 4096)` | 第二层残差 |
 
@@ -217,16 +220,16 @@ flowchart TD
 | 操作 | shape | 说明 |
 | --- | --- | --- |
 | `x` | `(1, 1, 4096)` | 新 token |
-| `q_proj` | `(1, 1, 8192)` → `(1, 64, 1, 128)` | 只有 1 个位置 |
-| `k_proj` / `v_proj` | `(1, 1, 1024)` → `(1, 8, 1, 128)` | 只有新 token 的 K/V |
+| `q_proj` | `(1, 1, 8192)` → `(1, 64, 1, 128)` | `x @ Wqᵀ(4096, 8192)`，只有 1 个位置 |
+| `k_proj` / `v_proj` | `(1, 1, 1024)` → `(1, 8, 1, 128)` | `x @ Wkᵀ / Wvᵀ(4096, 1024)`，只有新 token |
 | KV cache 追加 | `(1, 8, kv_len, 128)` | `kv_len` = 历史 + 当前 |
 | `repeat_kv` | `(1, 64, kv_len, 128)` | 概念上 |
 | `scores` | `(1, 64, 1, kv_len)` | q_len = 1，kv_len = 历史 + 1 |
 | `softmax` | `(1, 64, 1, kv_len)` | 每个 Q 对全部历史归一化 |
 | `attn @ V` | `(1, 64, 1, 128)` | 加权求和 |
-| `o_proj` | `(1, 1, 4096)` | — |
-| MoE | `(1, 4096) → (1, 4096)` | 1 个 token 选 8 个专家 |
-| `lm_head` | `(1, 1, 120832)` | 只取最后一个位置 |
+| `o_proj` | `(1, 1, 4096)` | `拼接结果 @ Woᵀ(8192, 4096)` |
+| MoE | `(1, 4096) → (1, 4096)` | 1 个 token 选 8 个专家；block 0 换成 dense FFN |
+| `lm_head` | `(1, 1, 120832)` | `y @ Wᵀ(4096, 120832)`，只取最后一个位置 |
 
 decode 和 prefill 的差别只有三处：
 

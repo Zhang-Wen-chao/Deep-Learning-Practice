@@ -60,9 +60,9 @@ def h3(title):
 
 def attention(b, q_len, kv_len, note=""):
     line("input RMSNorm", (b, q_len, H), "每个 token 独立，形状不变")
-    line("q_proj", (b, q_len, HQ), f"{H} → {HEADS}×{HEAD_DIM}")
-    line("k_proj", (b, q_len, HKV), f"{H} → {KV_HEADS}×{HEAD_DIM}")
-    line("v_proj", (b, q_len, HKV), f"{H} → {KV_HEADS}×{HEAD_DIM}")
+    line("q_proj", (b, q_len, HQ), f"Q← x({b},{q_len},{H}) @ Wqᵀ({H},{HQ})")
+    line("k_proj", (b, q_len, HKV), f"K← x({b},{q_len},{H}) @ Wkᵀ({H},{HKV})")
+    line("v_proj", (b, q_len, HKV), f"V← x({b},{q_len},{H}) @ Wvᵀ({H},{HKV})")
     line("拆头 q", (b, HEADS, q_len, HEAD_DIM),
          f"view(1,{q_len},{HEADS},{HEAD_DIM}).transpose(1,2)")
     line("拆头 k", (b, KV_HEADS, q_len, HEAD_DIM),
@@ -78,7 +78,7 @@ def attention(b, q_len, kv_len, note=""):
     line("softmax", (b, HEADS, q_len, kv_len), "dim=-1，每个 query 对全部 key 归一化")
     line("attn @ V", (b, HEADS, q_len, HEAD_DIM), "加权平均")
     line("拼头", (b, q_len, HQ), f"{HEADS} 个头拼回 {HQ}")
-    line("o_proj", (b, q_len, H), f"{HQ} → {H}")
+    line("o_proj", (b, q_len, H), f"拼接结果({b},{q_len},{HQ}) @ Woᵀ({HQ},{H})")
     line("+ 残差", (b, q_len, H), "attention 输出 + 子层输入")
     if note:
         print(f"  {'':<22}{'':<{W}}{note}")
@@ -87,10 +87,10 @@ def attention(b, q_len, kv_len, note=""):
 def dense_ffn(b, q_len):
     h3("dense FFN（layer 0）")
     line("post RMSNorm", (b, q_len, H), "第二个 RMSNorm")
-    line("gate_proj", (b, q_len, I), f"{H} → {I}")
-    line("up_proj", (b, q_len, I), f"{H} → {I}")
+    line("gate_proj", (b, q_len, I), f"x({b},{q_len},{H}) @ W1ᵀ({H},{I})")
+    line("up_proj", (b, q_len, I), f"x({b},{q_len},{H}) @ W3ᵀ({H},{I})")
     line("silu(gate) * up", (b, q_len, I), "逐元素")
-    line("down_proj", (b, q_len, H), f"{I} → {H}")
+    line("down_proj", (b, q_len, H), f"h({b},{q_len},{I}) @ W2ᵀ({I},{H})")
     line("+ 残差", (b, q_len, H), "FFN 输出 + 子层输入")
 
 
@@ -98,15 +98,18 @@ def moe(b, q_len, n_e, expert_note=""):
     h3("MoE")
     line("post RMSNorm", (b, q_len, H), "第二个 RMSNorm")
     line("x flatten", (b * q_len, H), "按 token 路由")
-    line("router", (b * q_len, E), f"x @ W_rᵀ，fp32；{E} 个专家")
+    line("router", (b * q_len, E), f"x({b * q_len},{H}) @ W_rᵀ({H},{E})，fp32")
     line("sigmoid + bias", (b * q_len, E), "bias 只影响 top-k 选择")
     line("top-k", (b * q_len, TOPK), f"每 token 选 {TOPK} 个")
     line("路由权重", (b * q_len, TOPK), "归一化后 × 2.826")
-    line("每个专家 gate_up", (n_e, 2 * IM), expert_note)
+    gu_note = f"x_e({n_e},{H}) @ W_gu[e]ᵀ({H},{2 * IM})"
+    if expert_note:
+        gu_note += f"；{expert_note}"
+    line("每个专家 gate_up", (n_e, 2 * IM), gu_note)
     line("silu(gate) * up", (n_e, IM), "逐元素")
-    line("每个专家 down", (n_e, H), f"{IM} → {H}")
-    line("shared gate/up", (b * q_len, IM), "shared expert，所有 token 都算")
-    line("shared down", (b * q_len, H), f"{IM} → {H}")
+    line("每个专家 down", (n_e, H), f"h({n_e},{IM}) @ W_d[e]ᵀ({IM},{H})")
+    line("shared gate/up", (b * q_len, IM), f"x({b * q_len},{H}) @ W_gateᵀ({H},{IM}) / W_upᵀ({H},{IM})")
+    line("shared down", (b * q_len, H), f"h({b * q_len},{IM}) @ W_downᵀ({IM},{H})")
     line("合并", (b, q_len, H), "routed + shared，reshape 回 3D")
     line("+ 残差", (b, q_len, H), "MoE 输出 + 子层输入")
 
@@ -119,10 +122,10 @@ def mtp():
     line("enorm", (1, 1, H), "RMSNorm")
     line("hnorm", (1, 1, H), "RMSNorm")
     line("cat", (1, 1, 2 * H), f"{H} + {H}")
-    line("eh_proj", (1, 1, H), f"{2 * H} → {H}")
+    line("eh_proj", (1, 1, H), f"cat(1,1,{2 * H}) @ Wᵀ({2 * H},{H})")
     line("decoder", (1, 1, H), "1 层 MoE decoder，内部同上")
     line("shared_head.norm", (1, 1, H), "RMSNorm")
-    line("lm_head", (1, 1, V), f"{H} → {V}（和主干共享）")
+    line("lm_head", (1, 1, V), f"y(1,1,{H}) @ Wᵀ({H},{V})（和主干共享）")
 
 
 def main():
@@ -134,6 +137,7 @@ def main():
     print(f"  num_experts={E}  num_experts_per_tok={TOPK}  "
           f"num_shared_experts={d['shared']}  moe_intermediate_size={IM}")
     print(f"  vocab_size={V}  max_position_embeddings={d['max_pos']}")
+    print("  注意：attention_bias=false, mlp_bias=false；所有 Linear 都没有 bias。")
     print(f"  参数: {p['main']:,}（主干）/ {p['total']:,}（含 MTP）")
     print(f"  KV cache: {2 * KV_HEADS * HEAD_DIM * d['dtype_bytes']:,} B / 层 / token"
           f"（80 层 = {2 * L * KV_HEADS * HEAD_DIM * d['dtype_bytes']:,} B / token）")
@@ -161,7 +165,7 @@ def main():
     print()
     print("[4] prefill：收尾")
     line("final RMSNorm", (BATCH_SIZE, SEQ_LEN, H), "最后一个 RMSNorm")
-    line("lm_head", (BATCH_SIZE, SEQ_LEN, V), f"{H} → {V}（不共享）")
+    line("lm_head", (BATCH_SIZE, SEQ_LEN, V), f"y({BATCH_SIZE},{SEQ_LEN},{H}) @ Wᵀ({H},{V})（不共享）")
     line("logits", (BATCH_SIZE, SEQ_LEN, V), f"{SEQ_LEN} 个位置各 {V} 个 logits")
     print(f"  只取最后一个位置: {(BATCH_SIZE, 1, V)}  →  下一个 token")
 
@@ -174,8 +178,8 @@ def main():
     h3("block 0 · attention + dense FFN")
     # decode attention: q_len=1, kv_len=KV_LEN
     line("input RMSNorm", (BATCH_SIZE, 1, H), "")
-    line("q_proj", (BATCH_SIZE, 1, HQ), f"{H} → {HQ}")
-    line("k_proj / v_proj", (BATCH_SIZE, 1, HKV), f"{H} → {HKV}")
+    line("q_proj", (BATCH_SIZE, 1, HQ), f"x({BATCH_SIZE},1,{H}) @ Wqᵀ({H},{HQ})")
+    line("k_proj / v_proj", (BATCH_SIZE, 1, HKV), f"x({BATCH_SIZE},1,{H}) @ Wkᵀ({H},{HKV}) / Wvᵀ({H},{HKV})")
     line("拆头 q", (BATCH_SIZE, HEADS, 1, HEAD_DIM),
          f"view(1,1,{HEADS},{HEAD_DIM}).transpose(1,2)")
     line("拆头 k / v", (BATCH_SIZE, KV_HEADS, 1, HEAD_DIM),
@@ -190,7 +194,7 @@ def main():
     line("softmax", (BATCH_SIZE, HEADS, 1, KV_LEN), "dim=-1")
     line("attn @ V", (BATCH_SIZE, HEADS, 1, HEAD_DIM), "")
     line("拼头", (BATCH_SIZE, 1, HQ), "")
-    line("o_proj", (BATCH_SIZE, 1, H), "")
+    line("o_proj", (BATCH_SIZE, 1, H), f"拼接结果({BATCH_SIZE},1,{HQ}) @ Woᵀ({HQ},{H})")
     line("+ 残差", (BATCH_SIZE, 1, H), "")
     line("dense FFN gate/up", (BATCH_SIZE, 1, I), "silu(gate) * up → down")
     line("dense FFN down", (BATCH_SIZE, 1, H), "")
@@ -198,7 +202,7 @@ def main():
     moe(BATCH_SIZE, 1, 1, f"{TOPK} 个被选中的专家各 1 token")
     line("block 2–79", (BATCH_SIZE, 1, H), "同 block 1，形状不变")
     line("final RMSNorm", (BATCH_SIZE, 1, H), "")
-    line("lm_head", (BATCH_SIZE, 1, V), f"{H} → {V}")
+    line("lm_head", (BATCH_SIZE, 1, V), f"y({BATCH_SIZE},1,{H}) @ Wᵀ({H},{V})")
     print("  每生成 1 个 token：KV 长度 +1，q_len 始终 = 1")
 
     print()
