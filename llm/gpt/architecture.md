@@ -200,7 +200,13 @@ prefill 时 `q_len = kv_len = seq_len`，mask 是下三角（行是 q、列是 k
 
 decode 时 `q_len = 1`，新的 query 可以看全部历史 K/V，所以 `scores` 是 `(batch_size, num_heads, 1, kv_len)`，不需要再遮未来——未来还没进 cache。
 
-> **实现注记**：朴素写法会先算满 `T×T` 再 `masked_fill`，QK/AV 各浪费约一半。实际推理用 FlashAttention / `F.scaled_dot_product_attention(is_causal=True)`，在 kernel 内按块跳过右上角，不 materialize 整张 `scores`。`model.py` 为了打印 shape，保留了朴素写法。
+> **实现注记**：语义上 mask 仍然在 `scores` 之后、softmax 之前；但实际 fused kernel 不是“整张算完再 mask”，而是按块处理：
+>
+> - 整块在因果边界之上：直接跳过，不算 QK；
+> - 整块在边界之下：正常算，不需要 mask；
+> - 对角线附近的块：QK 算完后，在 softmax 之前把块内右上角元素置 `-inf`。
+>
+> 这样不会 materialize 整张 `T×T`，也不需要单独的 mask 张量。FlashAttention / `F.scaled_dot_product_attention(is_causal=True)` 走的就是这条路；`model.py` 为了打印 shape，保留了“算满再 mask”的教学写法。
 >
 > 不能直接改 Q/K 来“加 mask”：mask 是 `(i,j)` 的配对关系，不是单个 token 的属性。可以在 `scores` 上加位置 bias（如 ALiBi），或者用 RoPE 改 Q/K 的相对位置，但因果截断仍然发生在 `scores` / softmax 这一层。
 
