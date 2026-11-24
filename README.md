@@ -4,11 +4,6 @@
 
 ## 项目结构
 
-### 🧠 llm/ - 大模型
-- Transformer 形状流向（shape flow）
-- BERT / GPT / 原版架构对照
-- 从 shape 推到参数量、计算量与量化位置
-
 ## 技术栈
 
 - PyTorch
